@@ -13,6 +13,29 @@ Offline-first, multi-tenant POS starter for food carts, built with Expo + Supaba
 - Dynamic tenant branding using `tenant_preferences.color_palette` and logo from Supabase Storage.
 - Offline queue foundation using Expo SQLite (`pending_mutations` table).
 
+## Phase 2 Included
+
+- Local-first storage for core POS data in SQLite:
+   - `local_products`
+   - `local_inventory_items`
+   - `local_sales`
+   - `local_sale_items`
+- Background sync engine:
+   - Pushes queued local mutations (`pending_mutations`) to Supabase.
+   - Pulls remote product/inventory changes into local cache.
+   - Uses a simple last-write-wins cursor strategy per tenant.
+- Single-device tenant model support:
+   - No multi-device conflict branch logic.
+   - Mutations are retried with backoff on transient network failure.
+
+## Sync Model
+
+- All POS reads/writes use local SQLite first.
+- Writes are enqueued and acknowledged immediately for offline use.
+- When online, sync runs periodically and on-demand:
+   - Push local pending writes.
+   - Pull backend updates such as price/inventory changes.
+
 ## Local Setup
 
 1. Install dependencies:
@@ -22,7 +45,6 @@ Offline-first, multi-tenant POS starter for food carts, built with Expo + Supaba
    ```
 
 2. Configure environment variables:
-
    - Copy `.env.example` to `.env`.
    - Fill in:
      - `EXPO_PUBLIC_SUPABASE_URL`

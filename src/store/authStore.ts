@@ -22,6 +22,10 @@ type AuthState = {
 let hasAuthListener = false;
 
 const loadContext = async (session: Session | null) => {
+  if (!supabase) {
+    throw new Error('Supabase is not configured. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.');
+  }
+
   const themeStore = useThemeStore.getState();
   if (!session?.user) {
     themeStore.reset();
@@ -42,36 +46,53 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   preferences: null,
 
   initialize: async () => {
+    if (!supabase) {
+      set({ initialized: true, loading: false, error: 'Supabase env vars are missing.' });
+      return;
+    }
+
     if (get().initialized) {
       return;
     }
 
     set({ loading: true, error: null });
 
-    const { data, error } = await supabase.auth.getSession();
-    if (error) {
-      set({ loading: false, initialized: true, error: error.message });
-      return;
-    }
-
     try {
-      const context = await loadContext(data.session);
+      const { data, error } = await supabase.auth.getSession();
+      if (error) {
+        set({ loading: false, initialized: true, error: error.message });
+        return;
+      }
+
+      try {
+        const context = await loadContext(data.session);
+        set({
+          session: data.session,
+          profile: context.profile,
+          preferences: context.preferences,
+          loading: false,
+          initialized: true,
+        });
+      } catch (contextError) {
+        set({
+          loading: false,
+          initialized: true,
+          session: data.session,
+          profile: null,
+          preferences: null,
+          error: contextError instanceof Error ? contextError.message : 'Failed to load user context',
+        });
+      }
+    } catch (initError) {
       set({
-        session: data.session,
-        profile: context.profile,
-        preferences: context.preferences,
         loading: false,
         initialized: true,
-      });
-    } catch (contextError) {
-      set({
-        loading: false,
-        initialized: true,
-        session: data.session,
+        session: null,
         profile: null,
         preferences: null,
-        error: contextError instanceof Error ? contextError.message : 'Failed to load user context',
+        error: initError instanceof Error ? initError.message : 'Failed to initialize auth state',
       });
+      return;
     }
 
     if (!hasAuthListener) {
@@ -99,6 +120,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   signInWithPassword: async (email, password) => {
+    if (!supabase) {
+      throw new Error('Supabase is not configured.');
+    }
+
     set({ loading: true, error: null });
     const { error } = await supabase.auth.signInWithPassword({ email, password });
     if (error) {
@@ -109,6 +134,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   signOut: async () => {
+    if (!supabase) {
+      useThemeStore.getState().reset();
+      set({ session: null, profile: null, preferences: null, loading: false, error: null });
+      return;
+    }
+
     set({ loading: true, error: null });
     const { error } = await supabase.auth.signOut();
     if (error) {

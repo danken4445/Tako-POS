@@ -1,0 +1,515 @@
+import { supabase } from '../lib/supabase';
+import {
+  upsertLocalCategories,
+  getPendingMutations,
+  getSyncCursor,
+  initializeOfflineDb,
+  markMutationFailed,
+  markMutationSynced,
+  markSaleSynced,
+  type LocalInventoryItem,
+  type LocalCategory,
+  type LocalProduct,
+  type LocalStaffMember,
+  upsertLocalStaffMembers,
+  updateSyncCursor,
+  upsertLocalInventoryItems,
+  upsertLocalProducts,
+} from './offlineDb';
+
+type SyncableTable = 'products' | 'inventory_items' | 'sales' | 'categories' | 'staff_members';
+
+type SaleMutationPayload = {
+  sale: {
+    id: string;
+    tenant_id: string;
+    cashier_profile_id: string | null;
+    total_cents: number;
+    gross_profit_cents: number;
+    expenses_cents: number;
+    net_profit_cents: number;
+    status: string;
+    created_at: string;
+  };
+  items: Array<{
+    id: string;
+    sale_id: string;
+    product_id: string | null;
+    tenant_id: string;
+    quantity: number;
+    unit_price_cents: number;
+    cost_price_cents: number;
+    selling_price_cents: number;
+    gross_margin_cents: number;
+    created_at: string;
+  }>;
+};
+
+type ProductRow = {
+  id: string;
+  tenant_id: string;
+  category_id: string | null;
+  name: string;
+  price_cents: number;
+  selling_price_cents: number | null;
+  cost_price_cents: number | null;
+  inventory_tracking: boolean | null;
+  stock_count: number | null;
+  linked_inventory_item_id: string | null;
+  deduction_multiplier: number | null;
+  active: boolean;
+  updated_at?: string;
+  created_at: string;
+};
+
+type CategoryRow = {
+  id: string;
+  tenant_id: string;
+  name: string;
+  color: string | null;
+  active: boolean;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
+type StaffRow = {
+  id: string;
+  tenant_id: string;
+  name: string;
+  role: string;
+  phone: string | null;
+  pin_code: string | null;
+  active: boolean;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
+type InventoryRow = {
+  id: string;
+  tenant_id: string;
+  sku: string | null;
+  name: string;
+  quantity: number;
+  unit: string | null;
+  updated_at: string;
+};
+
+let syncTimer: ReturnType<typeof setInterval> | null = null;
+let activeTenantId: string | null = null;
+let running = false;
+
+const SYNC_INTERVAL_MS = 8000;
+
+const isTransientNetworkError = (errorMessage: string): boolean => {
+  const normalized = errorMessage.toLowerCase();
+  return (
+    normalized.includes('network request failed') ||
+    normalized.includes('failed to fetch') ||
+    normalized.includes('timeout') ||
+    normalized.includes('connection')
+  );
+};
+
+const toLocalProduct = (row: ProductRow): LocalProduct => ({
+  id: row.id,
+  tenant_id: row.tenant_id,
+  category_id: row.category_id,
+  name: row.name,
+  price_cents: row.price_cents,
+  selling_price_cents: row.selling_price_cents ?? row.price_cents,
+  cost_price_cents: row.cost_price_cents ?? 0,
+  inventory_tracking: row.inventory_tracking ?? true,
+  stock_count: row.stock_count ?? 0,
+  linked_inventory_item_id: row.linked_inventory_item_id ?? null,
+  deduction_multiplier: row.deduction_multiplier ?? 1,
+  active: row.active,
+  updated_at: row.updated_at ?? row.created_at,
+  deleted_at: null,
+});
+
+const toLocalCategory = (row: CategoryRow): LocalCategory => ({
+  id: row.id,
+  tenant_id: row.tenant_id,
+  name: row.name,
+  color: row.color,
+  active: row.active,
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+  deleted_at: row.deleted_at,
+});
+
+const toLocalStaff = (row: StaffRow): LocalStaffMember => ({
+  id: row.id,
+  tenant_id: row.tenant_id,
+  name: row.name,
+  role: row.role,
+  phone: row.phone,
+  pin_code: row.pin_code,
+  active: row.active,
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+  deleted_at: row.deleted_at,
+});
+
+const toLocalInventory = (row: InventoryRow): LocalInventoryItem => ({
+  id: row.id,
+  tenant_id: row.tenant_id,
+  sku: row.sku,
+  name: row.name,
+  quantity: row.quantity,
+  unit: row.unit,
+  updated_at: row.updated_at,
+  deleted_at: null,
+});
+
+const pushMutation = async (tableName: string, payload: unknown): Promise<void> => {
+  if (!supabase) {
+    throw new Error('Supabase client unavailable.');
+  }
+
+  if (tableName === 'products') {
+    const product = payload as LocalProduct;
+    const { error } = await supabase.from('products').upsert(
+      {
+        id: product.id,
+        tenant_id: product.tenant_id,
+        category_id: product.category_id,
+        name: product.name,
+        price_cents: product.price_cents,
+        selling_price_cents: product.selling_price_cents,
+        cost_price_cents: product.cost_price_cents,
+        inventory_tracking: product.inventory_tracking,
+        stock_count: product.stock_count,
+        linked_inventory_item_id: product.linked_inventory_item_id,
+        deduction_multiplier: product.deduction_multiplier,
+        active: product.active,
+      },
+      { onConflict: 'id' }
+    );
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    return;
+  }
+
+  if (tableName === 'inventory_items') {
+    const item = payload as LocalInventoryItem;
+    const { error } = await supabase.from('inventory_items').upsert(
+      {
+        id: item.id,
+        tenant_id: item.tenant_id,
+        sku: item.sku,
+        name: item.name,
+        quantity: item.quantity,
+        unit: item.unit,
+      },
+      { onConflict: 'id' }
+    );
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    return;
+  }
+
+  if (tableName === 'sales') {
+    const salePayload = payload as SaleMutationPayload;
+
+    const { error: saleError } = await supabase.from('sales').upsert(
+      {
+        id: salePayload.sale.id,
+        tenant_id: salePayload.sale.tenant_id,
+        cashier_profile_id: salePayload.sale.cashier_profile_id,
+        total_cents: salePayload.sale.total_cents,
+        gross_profit_cents: salePayload.sale.gross_profit_cents,
+        expenses_cents: salePayload.sale.expenses_cents,
+        net_profit_cents: salePayload.sale.net_profit_cents,
+        status: salePayload.sale.status,
+        created_at: salePayload.sale.created_at,
+      },
+      { onConflict: 'id' }
+    );
+
+    if (saleError) {
+      throw new Error(saleError.message);
+    }
+
+    if (salePayload.items.length > 0) {
+      const { error: saleItemError } = await supabase.from('sale_items').upsert(
+        salePayload.items.map((item) => ({
+          id: item.id,
+          sale_id: item.sale_id,
+          product_id: item.product_id,
+          tenant_id: item.tenant_id,
+          quantity: item.quantity,
+          unit_price_cents: item.unit_price_cents,
+          cost_price_cents: item.cost_price_cents,
+          selling_price_cents: item.selling_price_cents,
+          gross_margin_cents: item.gross_margin_cents,
+          created_at: item.created_at,
+        })),
+        { onConflict: 'id' }
+      );
+
+      if (saleItemError) {
+        throw new Error(saleItemError.message);
+      }
+    }
+
+    await markSaleSynced(salePayload.sale.id);
+    return;
+  }
+
+  if (tableName === 'categories') {
+    const category = payload as LocalCategory;
+    const { error } = await supabase.from('categories').upsert(
+      {
+        id: category.id,
+        tenant_id: category.tenant_id,
+        name: category.name,
+        color: category.color,
+        active: category.active,
+        created_at: category.created_at,
+        updated_at: category.updated_at,
+        deleted_at: category.deleted_at,
+      },
+      { onConflict: 'id' }
+    );
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    return;
+  }
+
+  if (tableName === 'staff_members') {
+    const staffMember = payload as LocalStaffMember;
+    const { error } = await supabase.from('staff_members').upsert(
+      {
+        id: staffMember.id,
+        tenant_id: staffMember.tenant_id,
+        name: staffMember.name,
+        role: staffMember.role,
+        phone: staffMember.phone,
+        pin_code: staffMember.pin_code,
+        active: staffMember.active,
+        created_at: staffMember.created_at,
+        updated_at: staffMember.updated_at,
+        deleted_at: staffMember.deleted_at,
+      },
+      { onConflict: 'id' }
+    );
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    return;
+  }
+
+  throw new Error(`Unsupported sync table: ${tableName}`);
+};
+
+const pushPendingMutations = async (tenantId: string): Promise<void> => {
+  const pendingMutations = await getPendingMutations(tenantId, 100);
+
+  for (const mutation of pendingMutations) {
+    if (!['UPSERT'].includes(mutation.operation)) {
+      await markMutationSynced(mutation.id);
+      continue;
+    }
+
+    try {
+      await pushMutation(mutation.tableName as SyncableTable, mutation.payload);
+      await markMutationSynced(mutation.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown sync failure';
+      await markMutationFailed(mutation.id, message, mutation.attempts + 1);
+
+      if (isTransientNetworkError(message)) {
+        break;
+      }
+    }
+  }
+};
+
+const pullProducts = async (tenantId: string, productsCursor: string): Promise<string | null> => {
+  if (!supabase) {
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from('products')
+    .select('id, tenant_id, category_id, name, price_cents, selling_price_cents, cost_price_cents, inventory_tracking, stock_count, linked_inventory_item_id, deduction_multiplier, active, updated_at, created_at')
+    .eq('tenant_id', tenantId)
+    .gte('updated_at', productsCursor)
+    .order('updated_at', { ascending: true })
+    .limit(2000);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const rows = (data as ProductRow[]) ?? [];
+  if (rows.length === 0) {
+    return null;
+  }
+
+  await upsertLocalProducts(rows.map(toLocalProduct));
+  return rows[rows.length - 1]?.updated_at ?? rows[rows.length - 1]?.created_at ?? null;
+};
+
+const pullCategories = async (tenantId: string, categoriesCursor: string): Promise<string | null> => {
+  if (!supabase) {
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from('categories')
+    .select('id, tenant_id, name, color, active, created_at, updated_at, deleted_at')
+    .eq('tenant_id', tenantId)
+    .gte('updated_at', categoriesCursor)
+    .order('updated_at', { ascending: true })
+    .limit(2000);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const rows = (data as CategoryRow[]) ?? [];
+  if (rows.length === 0) {
+    return null;
+  }
+
+  await upsertLocalCategories(rows.map(toLocalCategory));
+  return rows[rows.length - 1]?.updated_at ?? rows[rows.length - 1]?.created_at ?? null;
+};
+
+const pullStaff = async (tenantId: string, staffCursor: string): Promise<string | null> => {
+  if (!supabase) {
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from('staff_members')
+    .select('id, tenant_id, name, role, phone, pin_code, active, created_at, updated_at, deleted_at')
+    .eq('tenant_id', tenantId)
+    .gte('updated_at', staffCursor)
+    .order('updated_at', { ascending: true })
+    .limit(2000);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const rows = (data as StaffRow[]) ?? [];
+  if (rows.length === 0) {
+    return null;
+  }
+
+  await upsertLocalStaffMembers(rows.map(toLocalStaff));
+  return rows[rows.length - 1]?.updated_at ?? rows[rows.length - 1]?.created_at ?? null;
+};
+
+const pullInventory = async (tenantId: string, inventoryCursor: string): Promise<string | null> => {
+  if (!supabase) {
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from('inventory_items')
+    .select('id, tenant_id, sku, name, quantity, unit, updated_at')
+    .eq('tenant_id', tenantId)
+    .gte('updated_at', inventoryCursor)
+    .order('updated_at', { ascending: true })
+    .limit(2000);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const rows = (data as InventoryRow[]) ?? [];
+  if (rows.length === 0) {
+    return null;
+  }
+
+  await upsertLocalInventoryItems(rows.map(toLocalInventory));
+  return rows[rows.length - 1]?.updated_at ?? null;
+};
+
+const pullRemoteUpdates = async (tenantId: string): Promise<void> => {
+  const cursors = await getSyncCursor(tenantId);
+  const nextProductCursor = await pullProducts(tenantId, cursors.productsCursor);
+  const nextInventoryCursor = await pullInventory(tenantId, cursors.inventoryCursor);
+  const nextCategoryCursor = await pullCategories(tenantId, cursors.categoriesCursor);
+  const nextStaffCursor = await pullStaff(tenantId, cursors.staffCursor);
+
+  if (!nextProductCursor && !nextInventoryCursor && !nextCategoryCursor && !nextStaffCursor) {
+    return;
+  }
+
+  await updateSyncCursor(tenantId, {
+    productsCursor: nextProductCursor ?? undefined,
+    inventoryCursor: nextInventoryCursor ?? undefined,
+    categoriesCursor: nextCategoryCursor ?? undefined,
+    staffCursor: nextStaffCursor ?? undefined,
+  });
+};
+
+const runSyncCycle = async (tenantId: string): Promise<void> => {
+  if (running || !supabase) {
+    return;
+  }
+
+  running = true;
+  try {
+    await pushPendingMutations(tenantId);
+    await pullRemoteUpdates(tenantId);
+  } finally {
+    running = false;
+  }
+};
+
+export const startSyncEngine = async (tenantId: string): Promise<void> => {
+  await initializeOfflineDb();
+
+  if (activeTenantId === tenantId && syncTimer) {
+    return;
+  }
+
+  activeTenantId = tenantId;
+  if (syncTimer) {
+    clearInterval(syncTimer);
+  }
+
+  await runSyncCycle(tenantId);
+  syncTimer = setInterval(() => {
+    if (!activeTenantId) {
+      return;
+    }
+
+    void runSyncCycle(activeTenantId);
+  }, SYNC_INTERVAL_MS);
+};
+
+export const triggerSyncNow = async (): Promise<void> => {
+  if (!activeTenantId) {
+    return;
+  }
+
+  await runSyncCycle(activeTenantId);
+};
+
+export const stopSyncEngine = (): void => {
+  activeTenantId = null;
+  if (syncTimer) {
+    clearInterval(syncTimer);
+    syncTimer = null;
+  }
+};

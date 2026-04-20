@@ -19,6 +19,10 @@ type TenantPreferenceQuery = {
 };
 
 const resolveTenantLogoUrl = async (logoPath: string | null): Promise<string | null> => {
+  if (!supabase) {
+    return null;
+  }
+
   if (!logoPath) {
     return null;
   }
@@ -34,9 +38,34 @@ const resolveTenantLogoUrl = async (logoPath: string | null): Promise<string | n
   return data.signedUrl;
 };
 
+const uploadTenantLogo = async (tenantId: string, imageUri: string): Promise<string> => {
+  if (!supabase) {
+    throw new Error('Supabase is not configured. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.');
+  }
+
+  const response = await fetch(imageUri);
+  const blob = await response.blob();
+  const logoPath = `${tenantId}/logo-${Date.now()}.png`;
+
+  const { error } = await supabase.storage.from('tenant-assets').upload(logoPath, blob, {
+    contentType: 'image/png',
+    upsert: true,
+  });
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return logoPath;
+};
+
 export const fetchUserContext = async (
   userId: string
 ): Promise<{ profile: UserProfile; preferences: TenantPreferences | null }> => {
+  if (!supabase) {
+    throw new Error('Supabase is not configured. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.');
+  }
+
   const { data: profileData, error: profileError } = await supabase
     .from('user_profiles')
     .select('id, user_id, tenant_id, role, display_name, tenants(name)')
@@ -79,5 +108,57 @@ export const fetchUserContext = async (
       logo_path: preferencesData.logo_path,
       logo_url: logoUrl,
     },
+  };
+};
+
+export const updateTenantPreferences = async (
+  tenantId: string,
+  colorPalette: TenantPreferences['color_palette'],
+  logoImageUri?: string | null
+): Promise<TenantPreferences> => {
+  if (!supabase) {
+    throw new Error('Supabase is not configured. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.');
+  }
+
+  let logoPath: string | null = null;
+  if (logoImageUri) {
+    logoPath = await uploadTenantLogo(tenantId, logoImageUri);
+  }
+
+  const { error } = await supabase.from('tenant_preferences').upsert(
+    {
+      tenant_id: tenantId,
+      color_palette: colorPalette,
+      logo_path: logoPath,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'tenant_id' }
+  );
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const { data } = await supabase
+    .from('tenant_preferences')
+    .select('tenant_id, color_palette, logo_path')
+    .eq('tenant_id', tenantId)
+    .single<TenantPreferenceQuery>();
+
+  if (!data) {
+    return {
+      tenant_id: tenantId,
+      color_palette: colorPalette,
+      logo_path: logoPath,
+      logo_url: null,
+    };
+  }
+
+  const logoUrl = await resolveTenantLogoUrl(data.logo_path);
+  return {
+    tenant_id: data.tenant_id,
+    color_palette: data.color_palette,
+    logo_path: data.logo_path,
+    logo_url: logoUrl,
   };
 };

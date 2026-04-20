@@ -1,43 +1,54 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Platform } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
 import { createClient } from '@supabase/supabase-js';
 
-import { supabaseAnonKey, supabaseUrl } from './env';
+import { hasSupabaseEnv, supabaseAnonKey, supabaseUrl } from './env';
 
 const secureStorageAdapter = {
   getItem: async (key: string): Promise<string | null> => {
     try {
-      const secureValue = await SecureStore.getItemAsync(key);
-      if (secureValue) {
-        return secureValue;
+      if (Platform.OS === 'web') {
+        return globalThis.localStorage?.getItem(key) ?? null;
       }
 
-      return await AsyncStorage.getItem(key);
+      return await SecureStore.getItemAsync(key);
     } catch {
-      return await AsyncStorage.getItem(key);
+      return null;
     }
   },
   setItem: async (key: string, value: string): Promise<void> => {
     try {
+      if (Platform.OS === 'web') {
+        globalThis.localStorage?.setItem(key, value);
+        return;
+      }
+
       await SecureStore.setItemAsync(key, value);
     } catch {
-      await AsyncStorage.setItem(key, value);
+      return;
     }
   },
   removeItem: async (key: string): Promise<void> => {
     try {
+      if (Platform.OS === 'web') {
+        globalThis.localStorage?.removeItem(key);
+        return;
+      }
+
       await SecureStore.deleteItemAsync(key);
     } catch {
-      await AsyncStorage.removeItem(key);
+      return;
     }
   },
 };
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-  auth: {
-    storage: secureStorageAdapter,
-    autoRefreshToken: true,
-    persistSession: true,
-    detectSessionInUrl: false,
-  },
-});
+export const supabase = hasSupabaseEnv
+  ? createClient(supabaseUrl as string, supabaseAnonKey as string, {
+      auth: {
+        storage: secureStorageAdapter,
+        autoRefreshToken: false,
+        persistSession: true,
+        detectSessionInUrl: false,
+      },
+    })
+  : null;

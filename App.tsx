@@ -2,13 +2,14 @@ import { StatusBar } from 'expo-status-bar';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import { useEffect } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
-import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 import { AdminDashboardScreen } from './src/screens/admin/AdminDashboardScreen';
 import { AuthScreen } from './src/screens/auth/AuthScreen';
 import { RotateDeviceScreen } from './src/screens/common/RotateDeviceScreen';
 import { PosLandscapeScreen } from './src/screens/pos/PosLandscapeScreen';
 import { initializeOfflineDb } from './src/services/offlineDb';
+import { startSyncEngine, stopSyncEngine } from './src/services/syncService';
+import { hasSupabaseEnv } from './src/lib/env';
 import { useAuthStore } from './src/store/authStore';
 import { useThemeStore } from './src/store/themeStore';
 
@@ -21,19 +22,39 @@ const AppShell = () => {
 
   useEffect(() => {
     const bootstrap = async () => {
-      await initializeOfflineDb();
-      await initialize();
+      try {
+        await initializeOfflineDb();
+      } catch (error) {
+        // Do not block app bootstrap forever if local DB setup fails.
+        console.error('Offline DB initialization failed', error);
+      }
+
+      if (hasSupabaseEnv) {
+        await initialize();
+      }
     };
 
-    bootstrap();
+    void bootstrap();
   }, [initialize]);
 
   useEffect(() => {
-    const applyRoleOrientation = async () => {
-      if (!profile) {
-        return;
-      }
+    if (!session || !profile?.tenant_id) {
+      stopSyncEngine();
+      return;
+    }
 
+    void startSyncEngine(profile.tenant_id);
+    return () => {
+      stopSyncEngine();
+    };
+  }, [session, profile?.tenant_id]);
+
+  useEffect(() => {
+    if (!profile) {
+      return;
+    }
+
+    const applyRoleOrientation = async () => {
       if (profile.role === 'Cashier') {
         await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
       } else {
@@ -43,6 +64,17 @@ const AppShell = () => {
 
     applyRoleOrientation();
   }, [profile]);
+
+  if (!hasSupabaseEnv) {
+    return (
+      <View style={[styles.loadingContainer, { backgroundColor: palette.background, paddingHorizontal: 20 }]}>
+        <Text style={[styles.missingTitle, { color: palette.text }]}>Supabase not configured</Text>
+        <Text style={[styles.loadingText, { color: palette.mutedText, textAlign: 'center' }]}>
+          Copy .env.example to .env and make sure EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY are set, then restart Expo with a clean cache.
+        </Text>
+      </View>
+    );
+  }
 
   if (!initialized || loading) {
     return (
@@ -84,12 +116,10 @@ const AppShell = () => {
 
 export default function App() {
   return (
-    <SafeAreaProvider>
-      <SafeAreaView style={styles.root}>
-        <StatusBar style="light" />
-        <AppShell />
-      </SafeAreaView>
-    </SafeAreaProvider>
+    <View style={styles.root}>
+      <StatusBar style="light" />
+      <AppShell />
+    </View>
   );
 }
 
@@ -105,5 +135,10 @@ const styles = StyleSheet.create({
   },
   loadingText: {
     fontSize: 13,
+  },
+  missingTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    marginBottom: 8,
   },
 });
