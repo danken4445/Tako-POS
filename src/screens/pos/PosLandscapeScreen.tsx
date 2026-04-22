@@ -7,7 +7,7 @@ import { createSaleLocalFirst, getPosSnapshot, type PosSnapshot } from '../../se
 import { useAuthStore } from '../../store/authStore';
 import { useThemeStore } from '../../store/themeStore';
 
-type DisplayCategory = 'all' | 'food' | 'drinks' | 'snacks' | 'desserts';
+type DisplayCategory = 'all' | string;
 
 type CatalogItem = {
   key: string;
@@ -18,20 +18,20 @@ type CatalogItem = {
   sellingPriceCents: number;
   stockCount: number;
   inventoryTracking: boolean;
-  categorySlug: DisplayCategory;
+  categoryKey: string;
   categoryLabel: string;
   icon: string;
 };
 
 type CartLine = CatalogItem & { quantity: number };
 
-const CATEGORY_TABS: Array<{ key: DisplayCategory; label: string }> = [
-  { key: 'all', label: 'All' },
-  { key: 'food', label: 'Food' },
-  { key: 'drinks', label: 'Drinks' },
-  { key: 'snacks', label: 'Snacks' },
-  { key: 'desserts', label: 'Desserts' },
-];
+type CategoryTab = {
+  key: DisplayCategory;
+  label: string;
+};
+
+const CASH_BILLS = [1000, 500, 100, 50, 20, 10];
+const TAX_RATE = 0.08;
 
 const phpFormatter = new Intl.NumberFormat('en-PH', {
   style: 'currency',
@@ -44,7 +44,7 @@ const money = (cents: number): string => phpFormatter.format(cents / 100);
 
 const normalize = (value: string): string => value.toLowerCase().replace(/[^a-z0-9]+/g, ' ');
 
-const toDisplayCategory = (value: string): DisplayCategory => {
+const toDisplayCategory = (value: string): string => {
   const normalized = normalize(value);
 
   if (normalized.includes('drink') || normalized.includes('coffee') || normalized.includes('tea') || normalized.includes('juice') || normalized.includes('latte') || normalized.includes('beverage')) {
@@ -63,10 +63,10 @@ const toDisplayCategory = (value: string): DisplayCategory => {
     return 'food';
   }
 
-  return 'all';
+  return 'other';
 };
 
-const iconForProduct = (name: string, category: DisplayCategory): string => {
+const iconForProduct = (name: string, category: string): string => {
   const normalized = normalize(name);
 
   if (category === 'drinks') {
@@ -105,8 +105,9 @@ const buildCatalog = (products: LocalProduct[], categories: LocalCategory[]): Ca
 
   return products.map((product) => {
     const linkedCategory = product.category_id ? categoryById.get(product.category_id) : null;
-    const categoryLabel = linkedCategory?.name ?? product.category_id ?? 'All';
-    const categorySlug = toDisplayCategory(`${categoryLabel} ${product.name}`);
+    const categoryLabel = linkedCategory?.name ?? 'Unassigned';
+    const categoryKey = linkedCategory?.id ?? 'unassigned';
+    const iconCategory = toDisplayCategory(`${categoryLabel} ${product.name}`);
     const displayPriceCents = product.selling_price_cents > 0 ? product.selling_price_cents : product.price_cents;
     const displayCostCents = product.cost_price_cents > 0 ? product.cost_price_cents : Math.max(0, Math.round(displayPriceCents * 0.6));
 
@@ -119,9 +120,9 @@ const buildCatalog = (products: LocalProduct[], categories: LocalCategory[]): Ca
       sellingPriceCents: displayPriceCents,
       stockCount: product.stock_count,
       inventoryTracking: product.inventory_tracking,
-      categorySlug,
-      categoryLabel: categorySlug === 'all' ? 'Other' : CATEGORY_TABS.find((tab) => tab.key === categorySlug)?.label ?? categoryLabel,
-      icon: iconForProduct(product.name, categorySlug),
+      categoryKey,
+      categoryLabel,
+      icon: iconForProduct(product.name, iconCategory),
     } satisfies CatalogItem;
   });
 };
@@ -131,6 +132,7 @@ export const PosLandscapeScreen = () => {
   const { palette } = useThemeStore();
   const [snapshot, setSnapshot] = useState<PosSnapshot | null>(null);
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
+  const [categoryTabs, setCategoryTabs] = useState<CategoryTab[]>([{ key: 'all', label: 'All' }]);
   const [activeCategory, setActiveCategory] = useState<DisplayCategory>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [paymentMethod, setPaymentMethod] = useState<'cash' | 'card' | 'qr'>('cash');
@@ -138,6 +140,7 @@ export const PosLandscapeScreen = () => {
   const [feedbackMessage, setFeedbackMessage] = useState<string>('Loading local POS data...');
   const [chargeOverride, setChargeOverride] = useState<string | null>(null);
   const [clockLabel, setClockLabel] = useState<string>('');
+  const [cashTenderInput, setCashTenderInput] = useState<string>('');
   const chargeResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const tenantId = profile?.tenant_id;
@@ -154,6 +157,17 @@ export const PosLandscapeScreen = () => {
     ]);
 
     setCatalog(buildCatalog(products, categories));
+    const tabs: CategoryTab[] = [
+      { key: 'all', label: 'All' },
+      ...categories.filter((category) => category.active).map((category) => ({ key: category.id, label: category.name })),
+    ];
+
+    const hasUnassigned = products.some((product) => !product.category_id || !categories.some((category) => category.id === product.category_id));
+    if (hasUnassigned) {
+      tabs.push({ key: 'unassigned', label: 'Unassigned' });
+    }
+
+    setCategoryTabs(tabs);
     setSnapshot(nextSnapshot);
     setFeedbackMessage(feedbackMessage ?? (products.length > 0 ? 'Local data is ready.' : 'No local products found in database.'));
   }, [tenantId]);
@@ -192,7 +206,7 @@ export const PosLandscapeScreen = () => {
     const query = searchQuery.trim().toLowerCase();
 
     return catalog.filter((product) => {
-      const categoryMatch = activeCategory === 'all' || product.categorySlug === activeCategory;
+      const categoryMatch = activeCategory === 'all' || product.categoryKey === activeCategory;
       const searchMatch =
         !query ||
         product.name.toLowerCase().includes(query) ||
@@ -202,12 +216,18 @@ export const PosLandscapeScreen = () => {
     });
   }, [activeCategory, catalog, searchQuery]);
 
+  useEffect(() => {
+    if (!categoryTabs.some((tab) => tab.key === activeCategory)) {
+      setActiveCategory('all');
+    }
+  }, [activeCategory, categoryTabs]);
+
   const cartLines = useMemo(() => Object.values(cart), [cart]);
 
   const totals = useMemo(() => {
-    const subtotalCents = cartLines.reduce((sum, line) => sum + line.priceCents * line.quantity, 0);
-    const taxCents = Math.round(subtotalCents * 0.08);
-    const grandTotalCents = subtotalCents + taxCents;
+    const grandTotalCents = cartLines.reduce((sum, line) => sum + line.priceCents * line.quantity, 0);
+    const taxCents = Math.round((grandTotalCents * TAX_RATE) / (1 + TAX_RATE));
+    const subtotalCents = Math.max(0, grandTotalCents - taxCents);
 
     return {
       subtotalCents,
@@ -216,6 +236,24 @@ export const PosLandscapeScreen = () => {
       totalItems: cartLines.reduce((sum, line) => sum + line.quantity, 0),
     };
   }, [cartLines]);
+
+  const cashTenderCents = useMemo(() => {
+    const normalized = cashTenderInput.trim();
+
+    if (!normalized) {
+      return 0;
+    }
+
+    const parsedPesos = Number(normalized.replace(/[^0-9]/g, ''));
+
+    if (!Number.isFinite(parsedPesos) || parsedPesos < 0) {
+      return 0;
+    }
+
+    return Math.round(parsedPesos * 100);
+  }, [cashTenderInput]);
+
+  const changeDueCents = useMemo(() => Math.max(0, cashTenderCents - totals.grandTotalCents), [cashTenderCents, totals.grandTotalCents]);
 
   const handleAddProduct = useCallback((product: CatalogItem) => {
     setCart((current) => {
@@ -236,6 +274,26 @@ export const PosLandscapeScreen = () => {
         },
       };
     });
+  }, []);
+
+  const handleAddCashBill = useCallback((billCents: number) => {
+    setCashTenderInput((current) => {
+      const parsedPesos = Number(current.trim().replace(/[^0-9]/g, '')) || 0;
+      return String(parsedPesos + billCents);
+    });
+  }, []);
+
+  const handleSetExactCash = useCallback(() => {
+    setCashTenderInput(String(Math.ceil(totals.grandTotalCents / 100)));
+  }, [totals.grandTotalCents]);
+
+  const handleClearCash = useCallback(() => {
+    setCashTenderInput('');
+  }, []);
+
+  const handleCashTenderInputChange = useCallback((value: string) => {
+    const normalized = value.replace(/[^0-9]/g, '');
+    setCashTenderInput(normalized);
   }, []);
 
   const handleUpdateQuantity = useCallback((key: string, delta: number) => {
@@ -264,8 +322,25 @@ export const PosLandscapeScreen = () => {
     });
   }, []);
 
+  const handleRemoveFromCart = useCallback((key: string) => {
+    setCart((current) => {
+      if (!current[key]) {
+        return current;
+      }
+
+      const { [key]: removed, ...rest } = current;
+      void removed;
+      return rest;
+    });
+  }, []);
+
   const handleCharge = useCallback(async () => {
     if (!tenantId || totals.grandTotalCents <= 0 || cartLines.length === 0) {
+      return;
+    }
+
+    if (paymentMethod === 'cash' && cashTenderCents < totals.grandTotalCents) {
+      setFeedbackMessage('Cash received is less than the total due.');
       return;
     }
 
@@ -287,7 +362,12 @@ export const PosLandscapeScreen = () => {
 
       setCart({});
       setChargeOverride('Payment complete!');
-      setFeedbackMessage('Sale saved locally and queued for sync.');
+      setFeedbackMessage(
+        paymentMethod === 'cash' && changeDueCents > 0
+          ? `Sale saved locally and queued for sync. Change due: ${money(changeDueCents)}`
+          : 'Sale saved locally and queued for sync.'
+      );
+      setCashTenderInput('');
 
       if (chargeResetRef.current) {
         clearTimeout(chargeResetRef.current);
@@ -301,7 +381,7 @@ export const PosLandscapeScreen = () => {
     } catch (error) {
       setFeedbackMessage(error instanceof Error ? error.message : 'Failed to save local sale');
     }
-  }, [cartLines, loadPosData, profile?.id, tenantId, totals.grandTotalCents]);
+  }, [cashTenderCents, cartLines, changeDueCents, loadPosData, paymentMethod, profile?.id, tenantId, totals.grandTotalCents]);
 
   const chargeLabel = chargeOverride ?? `Charge ${money(totals.grandTotalCents)}`;
   const catalogCount = snapshot?.productsCount ?? catalog.length;
@@ -321,37 +401,14 @@ export const PosLandscapeScreen = () => {
 
           <View style={styles.sidebarDivider} />
 
-          <Pressable style={[styles.sidebarButton, styles.sidebarButtonActive, { backgroundColor: `${palette.primary}22` }]}>
+          <View style={[styles.sidebarButton, styles.sidebarButtonActive, { backgroundColor: `${palette.primary}22` }]}>
             <Text style={[styles.sidebarGlyph, { color: palette.primary }]}>▣</Text>
-          </Pressable>
-
-          <Pressable style={styles.sidebarButton}>
-            <Text style={styles.sidebarGlyph}>☰</Text>
-            <View style={styles.sidebarBadge} />
-          </Pressable>
-
-          <Pressable style={styles.sidebarButton}>
-            <Text style={styles.sidebarGlyph}>⬢</Text>
-          </Pressable>
-
-          <Pressable style={styles.sidebarButton}>
-            <Text style={styles.sidebarGlyph}>▥</Text>
-          </Pressable>
-
-          <View style={styles.sidebarDivider} />
-
-          <Pressable style={styles.sidebarButton}>
-            <Text style={styles.sidebarGlyph}>◉</Text>
-          </Pressable>
+          </View>
 
           <View style={styles.sidebarSpacer} />
 
           <Pressable style={styles.sidebarButton} onPress={signOut}>
             <Text style={styles.sidebarGlyph}>⎋</Text>
-          </Pressable>
-
-          <Pressable style={styles.sidebarButton}>
-            <Text style={styles.sidebarGlyph}>⚙</Text>
           </Pressable>
         </View>
 
@@ -372,7 +429,7 @@ export const PosLandscapeScreen = () => {
             </View>
 
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tabStrip}>
-              {CATEGORY_TABS.map((tab) => {
+              {categoryTabs.map((tab) => {
                 const active = activeCategory === tab.key;
 
                 return (
@@ -456,10 +513,7 @@ export const PosLandscapeScreen = () => {
 
         <View style={[styles.orderPane, { backgroundColor: palette.surface, borderLeftColor: `${palette.text}12` }]}>
           <View style={[styles.orderHeader, { borderBottomColor: `${palette.text}12` }]}>
-            <View>
-              <Text style={[styles.orderTitle, { color: palette.text }]}>Current Order</Text>
-              <Text style={[styles.orderSubtitle, { color: palette.mutedText }]}>Walk-in customer checkout</Text>
-            </View>
+            <Text style={[styles.selectedItemsTitle, { color: palette.text }]}>SELECTED ITEMS</Text>
             <View style={[styles.orderCount, { backgroundColor: `${palette.primary}22` }]}>
               <Text style={[styles.orderCountText, { color: palette.primary }]}>
                 {totals.totalItems} {totals.totalItems === 1 ? 'item' : 'items'}
@@ -467,16 +521,6 @@ export const PosLandscapeScreen = () => {
             </View>
           </View>
 
-          <View style={[styles.customerRow, { borderBottomColor: `${palette.text}12` }]}>
-            <View style={[styles.customerAvatar, { backgroundColor: `${palette.primary}20` }]}>
-              <Text style={[styles.customerAvatarText, { color: palette.primary }]}>WK</Text>
-            </View>
-            <View style={styles.customerTextWrap}>
-              <Text style={[styles.customerName, { color: palette.text }]}>Walk-in Customer</Text>
-              <Text style={[styles.customerSub, { color: palette.mutedText }]}>No loyalty points</Text>
-            </View>
-            <Text style={[styles.customerChevron, { color: palette.mutedText }]}>›</Text>
-          </View>
 
           <View style={styles.orderStatsRow}>
             <View style={[styles.orderStatPill, { backgroundColor: `${palette.text}08`, borderColor: `${palette.text}10` }]}>
@@ -486,10 +530,6 @@ export const PosLandscapeScreen = () => {
             <View style={[styles.orderStatPill, { backgroundColor: `${palette.text}08`, borderColor: `${palette.text}10` }]}>
               <Text style={[styles.orderStatLabel, { color: palette.mutedText }]}>Sales</Text>
               <Text style={[styles.orderStatValue, { color: palette.text }]}>{salesCount}</Text>
-            </View>
-            <View style={[styles.orderStatPill, { backgroundColor: `${palette.text}08`, borderColor: `${palette.text}10` }]}>
-              <Text style={[styles.orderStatLabel, { color: palette.mutedText }]}>Sync</Text>
-              <Text style={[styles.orderStatValue, { color: palette.text }]}>{pendingCount}</Text>
             </View>
           </View>
 
@@ -524,6 +564,9 @@ export const PosLandscapeScreen = () => {
                       </Pressable>
                     </View>
                     <Text style={[styles.orderItemTotal, { color: palette.text }]}>{money(line.priceCents * line.quantity)}</Text>
+                    <Pressable style={[styles.removeItemButton, { borderColor: `${palette.danger}55` }]} onPress={() => handleRemoveFromCart(line.key)}>
+                      <Text style={[styles.removeItemButtonText, { color: palette.danger }]}>Remove</Text>
+                    </Pressable>
                   </View>
                 ))}
               </ScrollView>
@@ -531,22 +574,71 @@ export const PosLandscapeScreen = () => {
           </View>
 
           <View style={[styles.totalsBlock, { borderTopColor: `${palette.text}12` }]}>
-            <View style={styles.totalRow}>
-              <Text style={[styles.totalLabel, { color: palette.mutedText }]}>Subtotal</Text>
-              <Text style={[styles.totalValue, { color: palette.text }, styles.monoText]}>{money(totals.subtotalCents)}</Text>
-            </View>
-            <View style={styles.totalRow}>
-              <Text style={[styles.totalLabel, { color: palette.mutedText }]}>Tax (8%)</Text>
-              <Text style={[styles.totalValue, { color: palette.text }, styles.monoText]}>{money(totals.taxCents)}</Text>
-            </View>
-            <View style={[styles.totalDivider, { backgroundColor: `${palette.text}12` }]} />
-            <View style={styles.totalRow}>
-              <Text style={[styles.grandTotalLabel, { color: palette.text }]}>Total</Text>
-              <Text style={[styles.grandTotalValue, { color: palette.text }, styles.monoText]}>{money(totals.grandTotalCents)}</Text>
-            </View>
+          
+            {paymentMethod === 'cash' ? (
+              <>
+                <View style={styles.totalRow}>
+                  <Text style={[styles.totalLabel, { color: palette.mutedText }]}>Cash Received</Text>
+                  <Text style={[styles.totalValue, { color: palette.text }, styles.monoText]}>{money(cashTenderCents)}</Text>
+                </View>
+                <View style={styles.totalRow}>
+                  <Text style={[styles.totalLabel, { color: palette.mutedText }]}>Change</Text>
+                  <Text style={[styles.totalValue, { color: palette.success }, styles.monoText]}>{money(changeDueCents)}</Text>
+                </View>
+              </>
+            ) : null}
           </View>
 
           <View style={[styles.paymentBlock, { borderTopColor: `${palette.text}12` }]}>
+            {paymentMethod === 'cash' ? (
+              <View style={styles.cashTenderBlock}>
+                <View style={styles.cashTenderHeader}>
+                  <Text style={[styles.cashTenderTitle, { color: palette.text }]}>Cash tender</Text>
+                  <View style={[styles.cashTenderBadge, { backgroundColor: `${palette.primary}22` }]}>
+                    <Text style={[styles.cashTenderBadgeText, { color: palette.primary }]}>{money(cashTenderCents)}</Text>
+                  </View>
+                </View>
+
+                <TextInput
+                  style={[styles.cashTenderInput, { color: palette.text, backgroundColor: palette.background, borderColor: `${palette.text}12` }]}
+                  value={cashTenderInput}
+                  onChangeText={handleCashTenderInputChange}
+                  placeholder="Enter cash paid"
+                  placeholderTextColor={palette.mutedText}
+                  keyboardType="number-pad"
+                  returnKeyType="done"
+                />
+
+                <View style={styles.billGrid}>
+                  {CASH_BILLS.map((bill) => (
+                    <Pressable
+                      key={bill}
+                      onPress={() => handleAddCashBill(bill)}
+                      style={({ pressed }) => [
+                        styles.billButton,
+                        {
+                          borderColor: `${palette.text}12`,
+                          backgroundColor: `${palette.surface}CC`,
+                          opacity: pressed ? 0.86 : 1,
+                        },
+                      ]}
+                    >
+                      <Text style={[styles.billButtonValue, { color: palette.text }]}>{money(bill * 100)}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+
+                <View style={styles.cashTenderActions}>
+                  <Pressable style={({ pressed }) => [styles.cashActionButton, { borderColor: `${palette.text}22`, opacity: pressed ? 0.86 : 1 }]} onPress={handleSetExactCash}>
+                    <Text style={[styles.cashActionText, { color: palette.text }]}>Exact</Text>
+                  </Pressable>
+                  <Pressable style={({ pressed }) => [styles.cashActionButton, { borderColor: `${palette.text}22`, opacity: pressed ? 0.86 : 1 }]} onPress={handleClearCash}>
+                    <Text style={[styles.cashActionText, { color: palette.text }]}>Clear</Text>
+                  </Pressable>
+                </View>
+              </View>
+            ) : null}
+
             <View style={styles.paymentMethods}>
               {[
                 { key: 'cash', label: 'Cash', glyph: '$' },
@@ -585,7 +677,7 @@ export const PosLandscapeScreen = () => {
               disabled={totals.grandTotalCents <= 0}
             >
               <Text style={styles.chargeButtonGlyph}>→</Text>
-              <Text style={styles.chargeButtonText}>{chargeLabel}</Text>
+              <Text style={styles.chargeButtonText}>{paymentMethod === 'cash' ? `Charge ${money(totals.grandTotalCents)} • Change ${money(changeDueCents)}` : chargeLabel}</Text>
             </Pressable>
 
             <Text style={[styles.feedbackText, { color: palette.mutedText }]}>{feedbackMessage}</Text>
@@ -665,17 +757,6 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.58)',
     fontSize: 15,
     fontWeight: '700',
-  },
-  sidebarBadge: {
-    position: 'absolute',
-    right: 6,
-    top: 6,
-    width: 7,
-    height: 7,
-    borderRadius: 999,
-    backgroundColor: '#22c55e',
-    borderWidth: 1,
-    borderColor: '#18181b',
   },
   sidebarSpacer: {
     flex: 1,
@@ -847,7 +928,7 @@ const styles = StyleSheet.create({
     fontVariant: ['tabular-nums'],
   },
   orderPane: {
-    width: 300,
+    width: 380,
     flexShrink: 0,
     borderLeftWidth: StyleSheet.hairlineWidth,
   },
@@ -876,8 +957,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   orderCountText: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '700',
+  },
+  selectedItemsTitle: {
+    fontSize: 16,
+    fontWeight: '900',
+    letterSpacing: 0.4,
   },
   customerRow: {
     paddingHorizontal: 18,
@@ -908,11 +994,6 @@ const styles = StyleSheet.create({
   customerSub: {
     marginTop: 2,
     fontSize: 11,
-  },
-  customerChevron: {
-    fontSize: 18,
-    fontWeight: '300',
-    marginTop: -2,
   },
   orderStatsRow: {
     paddingHorizontal: 18,
@@ -966,9 +1047,9 @@ const styles = StyleSheet.create({
   orderItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: 8,
     paddingHorizontal: 18,
-    paddingVertical: 8,
+    paddingVertical: 10,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   orderItemIcon: {
@@ -987,12 +1068,12 @@ const styles = StyleSheet.create({
     minWidth: 0,
   },
   orderItemName: {
-    fontSize: 12,
-    fontWeight: '600',
+    fontSize: 14,
+    fontWeight: '700',
   },
   orderItemSub: {
     marginTop: 1,
-    fontSize: 11,
+    fontSize: 12,
   },
   orderQty: {
     flexDirection: 'row',
@@ -1000,35 +1081,114 @@ const styles = StyleSheet.create({
     gap: 5,
   },
   qtyButton: {
-    width: 20,
-    height: 20,
+    width: 24,
+    height: 24,
     borderRadius: 5,
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: StyleSheet.hairlineWidth,
   },
   qtyButtonText: {
-    fontSize: 13,
+    fontSize: 14,
     fontWeight: '700',
     lineHeight: 16,
   },
   qtyValue: {
-    minWidth: 14,
+    minWidth: 20,
     textAlign: 'center',
-    fontSize: 12,
+    fontSize: 13,
     fontWeight: '700',
   },
   orderItemTotal: {
-    width: 58,
+    width: 70,
     textAlign: 'right',
-    fontSize: 12,
+    fontSize: 13,
     fontWeight: '700',
+  },
+  removeItemButton: {
+    marginLeft: 4,
+    borderWidth: 1,
+    borderRadius: 8,
+    minHeight: 26,
+    paddingHorizontal: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  removeItemButtonText: {
+    fontSize: 11,
+    fontWeight: '800',
   },
   totalsBlock: {
     borderTopWidth: StyleSheet.hairlineWidth,
     paddingHorizontal: 18,
     paddingTop: 12,
     paddingBottom: 12,
+  },
+  cashTenderBlock: {
+    gap: 8,
+  },
+  cashTenderHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  cashTenderTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  cashTenderBadge: {
+    minHeight: 22,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cashTenderBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  cashTenderInput: {
+    minHeight: 38,
+    borderRadius: 9,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 12,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  billGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  billButton: {
+    minWidth: 64,
+    minHeight: 32,
+    paddingHorizontal: 10,
+    borderRadius: 9,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  billButtonValue: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  cashTenderActions: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  cashActionButton: {
+    flex: 1,
+    minHeight: 30,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cashActionText: {
+    fontSize: 11,
+    fontWeight: '700',
   },
   totalRow: {
     flexDirection: 'row',

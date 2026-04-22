@@ -18,6 +18,43 @@ type TenantPreferenceQuery = {
   logo_path: string | null;
 };
 
+const buildTenantPreferences = async (row: TenantPreferenceQuery | null, tenantId: string): Promise<TenantPreferences> => {
+  const logoUrl = await resolveTenantLogoUrl(row?.logo_path ?? null);
+
+  if (!row) {
+    return {
+      tenant_id: tenantId,
+      color_palette: null,
+      logo_path: null,
+      logo_url: logoUrl,
+    };
+  }
+
+  return {
+    tenant_id: row.tenant_id,
+    color_palette: row.color_palette,
+    logo_path: row.logo_path,
+    logo_url: logoUrl,
+  };
+};
+
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+};
+
 const resolveTenantLogoUrl = async (logoPath: string | null): Promise<string | null> => {
   if (!supabase) {
     return null;
@@ -27,15 +64,25 @@ const resolveTenantLogoUrl = async (logoPath: string | null): Promise<string | n
     return null;
   }
 
-  const { data, error } = await supabase.storage
-    .from('tenant-assets')
-    .createSignedUrl(logoPath, 60 * 60 * 24);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const { data, error } = await withTimeout(
+        supabase.storage.from('tenant-assets').createSignedUrl(logoPath, 60 * 60 * 24),
+        5000,
+        'Create signed logo URL'
+      );
 
-  if (error || !data?.signedUrl) {
-    return null;
+      if (!error && data?.signedUrl) {
+        return data.signedUrl;
+      }
+    } catch (error) {
+      if (attempt === 1) {
+        console.warn('Unable to sign tenant logo URL', error);
+      }
+    }
   }
 
-  return data.signedUrl;
+  return null;
 };
 
 const uploadTenantLogo = async (tenantId: string, imageUri: string): Promise<string> => {
@@ -95,19 +142,9 @@ export const fetchUserContext = async (
     throw new Error(prefError.message);
   }
 
-  if (!preferencesData) {
-    return { profile, preferences: null };
-  }
-
-  const logoUrl = await resolveTenantLogoUrl(preferencesData.logo_path);
   return {
     profile,
-    preferences: {
-      tenant_id: preferencesData.tenant_id,
-      color_palette: preferencesData.color_palette,
-      logo_path: preferencesData.logo_path,
-      logo_url: logoUrl,
-    },
+    preferences: preferencesData ? await buildTenantPreferences(preferencesData, profile.tenant_id) : null,
   };
 };
 
@@ -120,16 +157,28 @@ export const updateTenantPreferences = async (
     throw new Error('Supabase is not configured. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.');
   }
 
+  const { data: currentPreferences, error: currentError } = await supabase
+    .from('tenant_preferences')
+    .select('tenant_id, color_palette, logo_path')
+    .eq('tenant_id', tenantId)
+    .maybeSingle<TenantPreferenceQuery>();
+
+  if (currentError) {
+    throw new Error(currentError.message);
+  }
+
   let logoPath: string | null = null;
   if (logoImageUri) {
     logoPath = await uploadTenantLogo(tenantId, logoImageUri);
   }
 
+  const nextLogoPath = logoPath ?? currentPreferences?.logo_path ?? null;
+
   const { error } = await supabase.from('tenant_preferences').upsert(
     {
       tenant_id: tenantId,
       color_palette: colorPalette,
-      logo_path: logoPath,
+      logo_path: nextLogoPath,
       updated_at: new Date().toISOString(),
     },
     { onConflict: 'tenant_id' }
@@ -146,19 +195,8 @@ export const updateTenantPreferences = async (
     .single<TenantPreferenceQuery>();
 
   if (!data) {
-    return {
-      tenant_id: tenantId,
-      color_palette: colorPalette,
-      logo_path: logoPath,
-      logo_url: null,
-    };
+    return buildTenantPreferences({ tenant_id: tenantId, color_palette: colorPalette, logo_path: nextLogoPath }, tenantId);
   }
 
-  const logoUrl = await resolveTenantLogoUrl(data.logo_path);
-  return {
-    tenant_id: data.tenant_id,
-    color_palette: data.color_palette,
-    logo_path: data.logo_path,
-    logo_url: logoUrl,
-  };
+  return buildTenantPreferences(data, tenantId);
 };

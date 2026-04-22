@@ -50,6 +50,7 @@ type ProductRow = {
   tenant_id: string;
   category_id: string | null;
   name: string;
+  image_path: string | null;
   price_cents: number;
   selling_price_cents: number | null;
   cost_price_cents: number | null;
@@ -60,6 +61,14 @@ type ProductRow = {
   active: boolean;
   updated_at?: string;
   created_at: string;
+};
+
+type ProductInventoryLinkRow = {
+  tenant_id: string;
+  product_id: string;
+  inventory_item_id: string;
+  updated_at: string;
+  deleted_at: string | null;
 };
 
 type CategoryRow = {
@@ -112,17 +121,67 @@ const isTransientNetworkError = (errorMessage: string): boolean => {
   );
 };
 
-const toLocalProduct = (row: ProductRow): LocalProduct => ({
+const parseLinkedInventoryIds = (linkedIdsJson: string | null, fallbackLinkedId: string | null): string[] => {
+  if (linkedIdsJson) {
+    try {
+      const parsed = JSON.parse(linkedIdsJson);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((value): value is string => typeof value === 'string' && value.length > 0);
+      }
+    } catch {
+      // Ignore malformed local link payload and fall back to single linked ID.
+    }
+  }
+
+  return fallbackLinkedId ? [fallbackLinkedId] : [];
+};
+
+const buildLinkedIdsMap = (links: ProductInventoryLinkRow[]): Map<string, string[]> => {
+  const map = new Map<string, string[]>();
+
+  for (const link of links) {
+    if (link.deleted_at) {
+      continue;
+    }
+
+    const current = map.get(link.product_id) ?? [];
+    current.push(link.inventory_item_id);
+    map.set(link.product_id, current);
+  }
+
+  return map;
+};
+
+const mergeCursor = (left: string | null, right: string | null): string | null => {
+  if (!left) {
+    return right;
+  }
+
+  if (!right) {
+    return left;
+  }
+
+  return left > right ? left : right;
+};
+
+const toLocalProduct = (row: ProductRow, linkedInventoryIds?: string[]): LocalProduct => ({
   id: row.id,
   tenant_id: row.tenant_id,
   category_id: row.category_id,
   name: row.name,
+  image_path: row.image_path,
   price_cents: row.price_cents,
   selling_price_cents: row.selling_price_cents ?? row.price_cents,
   cost_price_cents: row.cost_price_cents ?? 0,
   inventory_tracking: row.inventory_tracking ?? true,
   stock_count: row.stock_count ?? 0,
-  linked_inventory_item_id: row.linked_inventory_item_id ?? null,
+  linked_inventory_item_id: linkedInventoryIds && linkedInventoryIds.length > 0 ? linkedInventoryIds[0] : row.linked_inventory_item_id ?? null,
+  linked_inventory_item_ids_json:
+    linkedInventoryIds && linkedInventoryIds.length > 0
+      ? JSON.stringify(Array.from(new Set(linkedInventoryIds)))
+      : row.linked_inventory_item_id
+        ? JSON.stringify([row.linked_inventory_item_id])
+        : null,
   deduction_multiplier: row.deduction_multiplier ?? 1,
   active: row.active,
   updated_at: row.updated_at ?? row.created_at,
@@ -171,12 +230,14 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
 
   if (tableName === 'products') {
     const product = payload as LocalProduct;
+    const linkedInventoryIds = parseLinkedInventoryIds(product.linked_inventory_item_ids_json, product.linked_inventory_item_id);
     const { error } = await supabase.from('products').upsert(
       {
         id: product.id,
         tenant_id: product.tenant_id,
         category_id: product.category_id,
         name: product.name,
+        image_path: product.image_path,
         price_cents: product.price_cents,
         selling_price_cents: product.selling_price_cents,
         cost_price_cents: product.cost_price_cents,
@@ -191,6 +252,58 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
 
     if (error) {
       throw new Error(error.message);
+    }
+
+    const { data: existingLinks, error: linksReadError } = await supabase
+      .from('product_inventory_links')
+      .select('inventory_item_id, deleted_at')
+      .eq('tenant_id', product.tenant_id)
+      .eq('product_id', product.id);
+
+    if (linksReadError) {
+      throw new Error(linksReadError.message);
+    }
+
+    const existingRows = (existingLinks ?? []) as Array<{ inventory_item_id: string; deleted_at: string | null }>;
+    const existingActiveIds = new Set(existingRows.filter((row) => !row.deleted_at).map((row) => row.inventory_item_id));
+    const desiredIds = Array.from(new Set(linkedInventoryIds));
+    const desiredIdSet = new Set(desiredIds);
+
+    const idsToArchive = Array.from(existingActiveIds).filter((id) => !desiredIdSet.has(id));
+
+    if (idsToArchive.length > 0) {
+      const { error: archiveError } = await supabase
+        .from('product_inventory_links')
+        .update({
+          deleted_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('tenant_id', product.tenant_id)
+        .eq('product_id', product.id)
+        .in('inventory_item_id', idsToArchive);
+
+      if (archiveError) {
+        throw new Error(archiveError.message);
+      }
+    }
+
+    if (desiredIds.length > 0) {
+      const now = new Date().toISOString();
+      const linkRows = desiredIds.map((inventoryItemId) => ({
+        tenant_id: product.tenant_id,
+        product_id: product.id,
+        inventory_item_id: inventoryItemId,
+        updated_at: now,
+        deleted_at: null,
+      }));
+
+      const { error: upsertLinksError } = await supabase
+        .from('product_inventory_links')
+        .upsert(linkRows, { onConflict: 'tenant_id,product_id,inventory_item_id' });
+
+      if (upsertLinksError) {
+        throw new Error(upsertLinksError.message);
+      }
     }
 
     return;
@@ -339,14 +452,17 @@ const pushPendingMutations = async (tenantId: string): Promise<void> => {
   }
 };
 
-const pullProducts = async (tenantId: string, productsCursor: string): Promise<string | null> => {
+const pullProducts = async (
+  tenantId: string,
+  productsCursor: string
+): Promise<{ cursor: string | null; productIds: string[] }> => {
   if (!supabase) {
-    return null;
+    return { cursor: null, productIds: [] };
   }
 
   const { data, error } = await supabase
     .from('products')
-    .select('id, tenant_id, category_id, name, price_cents, selling_price_cents, cost_price_cents, inventory_tracking, stock_count, linked_inventory_item_id, deduction_multiplier, active, updated_at, created_at')
+    .select('id, tenant_id, category_id, name, image_path, price_cents, selling_price_cents, cost_price_cents, inventory_tracking, stock_count, linked_inventory_item_id, deduction_multiplier, active, updated_at, created_at')
     .eq('tenant_id', tenantId)
     .gte('updated_at', productsCursor)
     .order('updated_at', { ascending: true })
@@ -358,11 +474,97 @@ const pullProducts = async (tenantId: string, productsCursor: string): Promise<s
 
   const rows = (data as ProductRow[]) ?? [];
   if (rows.length === 0) {
-    return null;
+    return { cursor: null, productIds: [] };
   }
 
-  await upsertLocalProducts(rows.map(toLocalProduct));
-  return rows[rows.length - 1]?.updated_at ?? rows[rows.length - 1]?.created_at ?? null;
+  const productIds = rows.map((row) => row.id);
+  const { data: linkData, error: linkError } = await supabase
+    .from('product_inventory_links')
+    .select('tenant_id, product_id, inventory_item_id, updated_at, deleted_at')
+    .eq('tenant_id', tenantId)
+    .in('product_id', productIds);
+
+  if (linkError) {
+    throw new Error(linkError.message);
+  }
+
+  const linkRows = (linkData as ProductInventoryLinkRow[]) ?? [];
+  const linkedIdsMap = buildLinkedIdsMap(linkRows);
+
+  await upsertLocalProducts(rows.map((row) => toLocalProduct(row, linkedIdsMap.get(row.id))));
+  return {
+    cursor: rows[rows.length - 1]?.updated_at ?? rows[rows.length - 1]?.created_at ?? null,
+    productIds,
+  };
+};
+
+const pullProductLinkChanges = async (
+  tenantId: string,
+  productsCursor: string
+): Promise<{ cursor: string | null; productIds: string[] }> => {
+  if (!supabase) {
+    return { cursor: null, productIds: [] };
+  }
+
+  const { data, error } = await supabase
+    .from('product_inventory_links')
+    .select('tenant_id, product_id, inventory_item_id, updated_at, deleted_at')
+    .eq('tenant_id', tenantId)
+    .gte('updated_at', productsCursor)
+    .order('updated_at', { ascending: true })
+    .limit(4000);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const rows = (data as ProductInventoryLinkRow[]) ?? [];
+  if (rows.length === 0) {
+    return { cursor: null, productIds: [] };
+  }
+
+  const productIds = Array.from(new Set(rows.map((row) => row.product_id)));
+  return {
+    cursor: rows[rows.length - 1]?.updated_at ?? null,
+    productIds,
+  };
+};
+
+const refreshProductsFromCloud = async (tenantId: string, productIds: string[]): Promise<void> => {
+  if (!supabase || productIds.length === 0) {
+    return;
+  }
+
+  const { data: productData, error: productError } = await supabase
+    .from('products')
+    .select('id, tenant_id, category_id, name, image_path, price_cents, selling_price_cents, cost_price_cents, inventory_tracking, stock_count, linked_inventory_item_id, deduction_multiplier, active, updated_at, created_at')
+    .eq('tenant_id', tenantId)
+    .in('id', productIds)
+    .limit(4000);
+
+  if (productError) {
+    throw new Error(productError.message);
+  }
+
+  const rows = (productData as ProductRow[]) ?? [];
+  if (rows.length === 0) {
+    return;
+  }
+
+  const { data: linkData, error: linkError } = await supabase
+    .from('product_inventory_links')
+    .select('tenant_id, product_id, inventory_item_id, updated_at, deleted_at')
+    .eq('tenant_id', tenantId)
+    .in('product_id', rows.map((row) => row.id));
+
+  if (linkError) {
+    throw new Error(linkError.message);
+  }
+
+  const linkRows = (linkData as ProductInventoryLinkRow[]) ?? [];
+  const linkedIdsMap = buildLinkedIdsMap(linkRows);
+
+  await upsertLocalProducts(rows.map((row) => toLocalProduct(row, linkedIdsMap.get(row.id))));
 };
 
 const pullCategories = async (tenantId: string, categoriesCursor: string): Promise<string | null> => {
@@ -445,10 +647,18 @@ const pullInventory = async (tenantId: string, inventoryCursor: string): Promise
 
 const pullRemoteUpdates = async (tenantId: string): Promise<void> => {
   const cursors = await getSyncCursor(tenantId);
-  const nextProductCursor = await pullProducts(tenantId, cursors.productsCursor);
+  const pulledProducts = await pullProducts(tenantId, cursors.productsCursor);
+  const pulledProductLinks = await pullProductLinkChanges(tenantId, cursors.productsCursor);
+
+  const linkOnlyProductIds = pulledProductLinks.productIds.filter((productId) => !pulledProducts.productIds.includes(productId));
+  if (linkOnlyProductIds.length > 0) {
+    await refreshProductsFromCloud(tenantId, linkOnlyProductIds);
+  }
+
   const nextInventoryCursor = await pullInventory(tenantId, cursors.inventoryCursor);
   const nextCategoryCursor = await pullCategories(tenantId, cursors.categoriesCursor);
   const nextStaffCursor = await pullStaff(tenantId, cursors.staffCursor);
+  const nextProductCursor = mergeCursor(pulledProducts.cursor, pulledProductLinks.cursor);
 
   if (!nextProductCursor && !nextInventoryCursor && !nextCategoryCursor && !nextStaffCursor) {
     return;

@@ -20,12 +20,14 @@ export type LocalProduct = {
   tenant_id: string;
   category_id: string | null;
   name: string;
+  image_path: string | null;
   price_cents: number;
   selling_price_cents: number;
   cost_price_cents: number;
   inventory_tracking: boolean;
   stock_count: number;
   linked_inventory_item_id: string | null;
+  linked_inventory_item_ids_json: string | null;
   deduction_multiplier: number;
   active: boolean;
   updated_at: string;
@@ -110,7 +112,23 @@ type ProductStockRow = {
   inventory_tracking: number;
   stock_count: number;
   linked_inventory_item_id: string | null;
+  linked_inventory_item_ids_json: string | null;
   deduction_multiplier: number | null;
+};
+
+const parseLinkedInventoryIds = (linkedIdsJson: string | null, fallbackLinkedId: string | null): string[] => {
+  if (linkedIdsJson) {
+    try {
+      const parsed = JSON.parse(linkedIdsJson);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((value): value is string => typeof value === 'string' && value.length > 0);
+      }
+    } catch {
+      // Ignore malformed JSON and use fallback linked ID.
+    }
+  }
+
+  return fallbackLinkedId ? [fallbackLinkedId] : [];
 };
 
 export type PendingMutation = {
@@ -184,12 +202,14 @@ export const initializeOfflineDb = async (): Promise<void> => {
       tenant_id TEXT NOT NULL,
       category_id TEXT,
       name TEXT NOT NULL,
+      image_path TEXT,
       price_cents INTEGER NOT NULL,
       selling_price_cents INTEGER NOT NULL DEFAULT 0,
       cost_price_cents INTEGER NOT NULL DEFAULT 0,
       inventory_tracking INTEGER NOT NULL DEFAULT 1,
       stock_count REAL NOT NULL DEFAULT 0,
       linked_inventory_item_id TEXT,
+      linked_inventory_item_ids_json TEXT,
       deduction_multiplier REAL NOT NULL DEFAULT 1,
       active INTEGER NOT NULL DEFAULT 1,
       updated_at TEXT NOT NULL,
@@ -327,6 +347,14 @@ export const initializeOfflineDb = async (): Promise<void> => {
   `).catch(() => undefined);
 
   await db.execAsync(`
+    ALTER TABLE local_products ADD COLUMN linked_inventory_item_ids_json TEXT;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_products ADD COLUMN image_path TEXT;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
     ALTER TABLE local_products ADD COLUMN deduction_multiplier REAL NOT NULL DEFAULT 1;
   `).catch(() => undefined);
 
@@ -419,12 +447,14 @@ export const listLocalProducts = async (tenantId: string): Promise<LocalProduct[
         tenant_id,
         category_id,
         name,
+        image_path,
         price_cents,
         selling_price_cents,
         cost_price_cents,
         inventory_tracking,
         stock_count,
         linked_inventory_item_id,
+        linked_inventory_item_ids_json,
         deduction_multiplier,
         active,
         updated_at,
@@ -442,6 +472,7 @@ export const listLocalProducts = async (tenantId: string): Promise<LocalProduct[
     active: Boolean(row.active),
     inventory_tracking: Boolean(row.inventory_tracking),
     linked_inventory_item_id: row.linked_inventory_item_id ?? null,
+    linked_inventory_item_ids_json: row.linked_inventory_item_ids_json ?? null,
     deduction_multiplier: Number(row.deduction_multiplier ?? 1),
   }));
 };
@@ -537,28 +568,32 @@ export const upsertLocalProducts = async (products: LocalProduct[]): Promise<voi
             tenant_id,
             category_id,
             name,
+            image_path,
             price_cents,
             selling_price_cents,
             cost_price_cents,
             inventory_tracking,
             stock_count,
             linked_inventory_item_id,
+            linked_inventory_item_ids_json,
             deduction_multiplier,
             active,
             updated_at,
             deleted_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             tenant_id = excluded.tenant_id,
             category_id = excluded.category_id,
             name = excluded.name,
+            image_path = excluded.image_path,
             price_cents = excluded.price_cents,
             selling_price_cents = excluded.selling_price_cents,
             cost_price_cents = excluded.cost_price_cents,
             inventory_tracking = excluded.inventory_tracking,
             stock_count = excluded.stock_count,
             linked_inventory_item_id = excluded.linked_inventory_item_id,
+            linked_inventory_item_ids_json = excluded.linked_inventory_item_ids_json,
             deduction_multiplier = excluded.deduction_multiplier,
             active = excluded.active,
             updated_at = excluded.updated_at,
@@ -569,12 +604,14 @@ export const upsertLocalProducts = async (products: LocalProduct[]): Promise<voi
           product.tenant_id,
           product.category_id,
           product.name,
+          product.image_path,
           product.price_cents,
           product.selling_price_cents,
           product.cost_price_cents,
           product.inventory_tracking ? 1 : 0,
           product.stock_count,
           product.linked_inventory_item_id,
+          product.linked_inventory_item_ids_json,
           product.deduction_multiplier,
           product.active ? 1 : 0,
           product.updated_at,
@@ -767,7 +804,7 @@ export const createLocalSale = async (input: LocalSaleInput): Promise<string> =>
       if (item.product_id) {
         const product = await db.getFirstAsync<ProductStockRow>(
           `
-            SELECT id, selling_price_cents, cost_price_cents, inventory_tracking, stock_count, linked_inventory_item_id, deduction_multiplier
+            SELECT id, selling_price_cents, cost_price_cents, inventory_tracking, stock_count, linked_inventory_item_id, linked_inventory_item_ids_json, deduction_multiplier
             FROM local_products
             WHERE id = ? AND tenant_id = ?
             LIMIT 1
@@ -779,35 +816,39 @@ export const createLocalSale = async (input: LocalSaleInput): Promise<string> =>
           sellingPriceCents = item.selling_price_cents ?? product.selling_price_cents;
           costPriceCents = item.cost_price_cents ?? product.cost_price_cents;
 
-          if (product.linked_inventory_item_id) {
+          const linkedInventoryIds = parseLinkedInventoryIds(product.linked_inventory_item_ids_json, product.linked_inventory_item_id);
+
+          if (linkedInventoryIds.length > 0) {
             const linkedMultiplier = Number(product.deduction_multiplier ?? 1);
 
             if (!Number.isFinite(linkedMultiplier) || linkedMultiplier <= 0) {
               throw new Error(`Invalid linked inventory multiplier for item ${item.product_id}`);
             }
 
-            const linkedInventory = await db.getFirstAsync<{ id: string; quantity: number }>(
-              `
-                SELECT id, quantity
-                FROM local_inventory_items
-                WHERE id = ?
-                  AND tenant_id = ?
-                  AND deleted_at IS NULL
-                LIMIT 1
-              `,
-              [product.linked_inventory_item_id, input.tenant_id]
-            );
+            for (const linkedInventoryId of linkedInventoryIds) {
+              const linkedInventory = await db.getFirstAsync<{ id: string; quantity: number }>(
+                `
+                  SELECT id, quantity
+                  FROM local_inventory_items
+                  WHERE id = ?
+                    AND tenant_id = ?
+                    AND deleted_at IS NULL
+                  LIMIT 1
+                `,
+                [linkedInventoryId, input.tenant_id]
+              );
 
-            if (!linkedInventory) {
-              throw new Error(`Linked inventory item not found for item ${item.product_id}`);
+              if (!linkedInventory) {
+                throw new Error(`Linked inventory item not found for item ${item.product_id}`);
+              }
+
+              const projectedQuantity = (inventoryItemUpdates.get(linkedInventory.id) ?? linkedInventory.quantity) - quantity * linkedMultiplier;
+              if (projectedQuantity < 0) {
+                throw new Error(`Insufficient linked inventory for item ${item.product_id}`);
+              }
+
+              inventoryItemUpdates.set(linkedInventory.id, projectedQuantity);
             }
-
-            const projectedQuantity = (inventoryItemUpdates.get(linkedInventory.id) ?? linkedInventory.quantity) - quantity * linkedMultiplier;
-            if (projectedQuantity < 0) {
-              throw new Error(`Insufficient linked inventory for item ${item.product_id}`);
-            }
-
-            inventoryItemUpdates.set(linkedInventory.id, projectedQuantity);
           } else if (Boolean(product.inventory_tracking)) {
             const projectedQuantity = (productStockUpdates.get(product.id) ?? product.stock_count) - quantity;
             if (projectedQuantity < 0) {
@@ -928,6 +969,7 @@ export const createLocalSale = async (input: LocalSaleInput): Promise<string> =>
             inventory_tracking,
             stock_count,
             linked_inventory_item_id,
+            linked_inventory_item_ids_json,
             deduction_multiplier,
             active,
             updated_at,
@@ -946,6 +988,7 @@ export const createLocalSale = async (input: LocalSaleInput): Promise<string> =>
           inventory_tracking: Boolean(nextProduct.inventory_tracking),
           category_id: nextProduct.category_id,
           linked_inventory_item_id: nextProduct.linked_inventory_item_id ?? null,
+          linked_inventory_item_ids_json: nextProduct.linked_inventory_item_ids_json ?? null,
           deduction_multiplier: Number(nextProduct.deduction_multiplier ?? 1),
         };
 

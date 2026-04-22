@@ -19,22 +19,18 @@ type AuthState = {
   refreshContext: () => Promise<void>;
 };
 
-let hasAuthListener = false;
+let authStateChangeSubscription: { unsubscribe: () => void } | null = null;
 
 const loadContext = async (session: Session | null) => {
   if (!supabase) {
     throw new Error('Supabase is not configured. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.');
   }
 
-  const themeStore = useThemeStore.getState();
   if (!session?.user) {
-    themeStore.reset();
     return { profile: null, preferences: null };
   }
 
-  const context = await fetchUserContext(session.user.id);
-  themeStore.hydrateFromTenant(context.preferences);
-  return context;
+  return fetchUserContext(session.user.id);
 };
 
 export const useAuthStore = create<AuthState>((set, get) => ({
@@ -66,14 +62,20 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
       try {
         const context = await loadContext(data.session);
+        if (!context.preferences) {
+          useThemeStore.getState().reset();
+        } else {
+          useThemeStore.getState().hydrateFromTenant(context.preferences);
+        }
         set({
           session: data.session,
           profile: context.profile,
           preferences: context.preferences,
-          loading: false,
           initialized: true,
+          loading: false,
         });
       } catch (contextError) {
+        useThemeStore.getState().reset();
         set({
           loading: false,
           initialized: true,
@@ -95,17 +97,23 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       return;
     }
 
-    if (!hasAuthListener) {
-      supabase.auth.onAuthStateChange(async (_event, session) => {
+    if (!authStateChangeSubscription) {
+      const { data } = supabase.auth.onAuthStateChange(async (_event, session) => {
         set({ session, loading: true, error: null });
         try {
           const context = await loadContext(session);
+          if (!context.preferences) {
+            useThemeStore.getState().reset();
+          } else {
+            useThemeStore.getState().hydrateFromTenant(context.preferences);
+          }
           set({
             profile: context.profile,
             preferences: context.preferences,
             loading: false,
           });
         } catch (listenerError) {
+          useThemeStore.getState().reset();
           set({
             profile: null,
             preferences: null,
@@ -115,7 +123,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         }
       });
 
-      hasAuthListener = true;
+      authStateChangeSubscription = data.subscription;
     }
   },
 
@@ -130,7 +138,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       set({ loading: false, error: error.message });
       throw error;
     }
-    set({ loading: false });
   },
 
   signOut: async () => {

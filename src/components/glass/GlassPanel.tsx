@@ -1,17 +1,19 @@
-import type { ReactNode } from 'react';
+import { memo, type ReactNode } from 'react';
 import { StyleSheet, View } from 'react-native';
 
 type GlassPanelProps = {
   children: ReactNode;
 };
 
-export const GlassPanel = ({ children }: GlassPanelProps) => {
+const GlassPanelComponent = ({ children }: GlassPanelProps) => {
   return (
     <View style={styles.wrapper}>
       <View style={styles.overlay}>{children}</View>
     </View>
   );
 };
+
+export const GlassPanel = memo(GlassPanelComponent);
 
 const styles = StyleSheet.create({
   wrapper: {
@@ -23,6 +25,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.18,
     shadowRadius: 20,
     shadowOffset: { width: 0, height: 10 },
+    elevation: 5,
   },
   overlay: {
     backgroundColor: 'rgba(255,255,255,0.06)',

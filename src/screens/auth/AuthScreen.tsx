@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -17,17 +17,18 @@ import { useThemeStore } from '../../store/themeStore';
 export const AuthScreen = () => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const passwordRef = useRef<TextInput>(null);
 
   const { signInWithPassword, loading, error } = useAuthStore();
   const palette = useThemeStore((state) => state.palette);
 
-  const onLogin = async () => {
+  const onLogin = useCallback(async () => {
     if (!email || !password || loading) {
       return;
     }
 
     await signInWithPassword(email.trim(), password);
-  };
+  }, [email, loading, password, signInWithPassword]);
 
   return (
     <View style={[styles.container, { backgroundColor: palette.background }]}>
@@ -43,25 +44,34 @@ export const AuthScreen = () => {
           <TextInput
             autoCapitalize="none"
             keyboardType="email-address"
+            returnKeyType="next"
             placeholder="Email"
             placeholderTextColor={palette.mutedText}
             style={[styles.input, { color: palette.text, borderColor: `${palette.text}33` }]}
             value={email}
             onChangeText={setEmail}
+            onSubmitEditing={() => passwordRef.current?.focus()}
           />
           <TextInput
+            ref={passwordRef}
             secureTextEntry
+            returnKeyType="done"
             placeholder="Password"
             placeholderTextColor={palette.mutedText}
             style={[styles.input, { color: palette.text, borderColor: `${palette.text}33` }]}
             value={password}
             onChangeText={setPassword}
+            onSubmitEditing={onLogin}
           />
 
           {!!error && <Text style={[styles.error, { color: palette.danger }]}>{error}</Text>}
 
           <Pressable
             onPress={onLogin}
+            accessibilityRole="button"
+            accessibilityLabel="Sign in"
+            accessibilityState={{ disabled: loading }}
+            disabled={loading}
             style={[styles.button, { backgroundColor: palette.primary, opacity: loading ? 0.7 : 1 }]}
           >
             {loading ? (

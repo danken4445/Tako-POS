@@ -1,6 +1,7 @@
 import {
   createLocalSale,
   getPendingMutationCount,
+  withOfflineDb,
   listLocalInventoryItems,
   listLocalProducts,
   listLocalSales,
@@ -21,22 +22,64 @@ export type PosSnapshot = {
 };
 
 export const getPosSnapshot = async (tenantId: string): Promise<PosSnapshot> => {
-  const [products, inventory, sales, pendingMutations] = await Promise.all([
+  const [products, inventory, salesAgg, latestSale, pendingMutations] = await Promise.all([
     listLocalProducts(tenantId),
     listLocalInventoryItems(tenantId),
-    listLocalSales(tenantId, 1),
+    withOfflineDb(async (db) => {
+      return db.getFirstAsync<{
+        gross_profit_cents: number | null;
+        expenses_cents: number | null;
+        net_profit_cents: number | null;
+      }>(
+        `
+          SELECT
+            COALESCE(SUM(gross_profit_cents), 0) AS gross_profit_cents,
+            COALESCE(SUM(expenses_cents), 0) AS expenses_cents,
+            COALESCE(SUM(net_profit_cents), 0) AS net_profit_cents
+          FROM local_sales
+          WHERE tenant_id = ?
+        `,
+        [tenantId]
+      );
+    }),
+    withOfflineDb(async (db) => {
+      return db.getFirstAsync<LocalSale>(
+        `
+          SELECT
+            id,
+            tenant_id,
+            cashier_profile_id,
+            total_cents,
+            gross_profit_cents,
+            expenses_cents,
+            net_profit_cents,
+            status,
+            created_at,
+            updated_at,
+            synced_at
+          FROM local_sales
+          WHERE tenant_id = ?
+          ORDER BY created_at DESC
+          LIMIT 1
+        `,
+        [tenantId]
+      );
+    }),
     getPendingMutationCount(tenantId),
   ]);
 
   return {
     productsCount: products.length,
     inventoryCount: inventory.length,
-    salesCount: sales.length,
+    salesCount: await withOfflineDb(async (db) => {
+      const row = await db.getFirstAsync<{ count: number }>('SELECT COUNT(1) as count FROM local_sales WHERE tenant_id = ?', [tenantId]);
+      return row?.count ?? 0;
+    }),
     pendingMutations,
-    grossProfitCents: sales.reduce((sum, sale) => sum + sale.gross_profit_cents, 0),
-    expensesCents: sales.reduce((sum, sale) => sum + sale.expenses_cents, 0),
-    netProfitCents: sales.reduce((sum, sale) => sum + sale.net_profit_cents, 0),
-    latestSale: sales[0] ?? null,
+    grossProfitCents: salesAgg?.gross_profit_cents ?? 0,
+    expensesCents: salesAgg?.expenses_cents ?? 0,
+    netProfitCents: salesAgg?.net_profit_cents ?? 0,
+    latestSale: latestSale ?? null,
   };
 };
 

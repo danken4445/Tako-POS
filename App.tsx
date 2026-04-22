@@ -58,7 +58,7 @@ const AppShell = () => {
       if (profile.role === 'Cashier') {
         await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
       } else {
-        await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
+        await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.DEFAULT);
       }
     };
 
@@ -105,10 +105,6 @@ const AppShell = () => {
     }
 
     return <PosLandscapeScreen />;
-  }
-
-  if (isLandscape) {
-    return <RotateDeviceScreen target="portrait" />;
   }
 
   return <AdminDashboardScreen />;

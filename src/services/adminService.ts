@@ -1,4 +1,5 @@
-import { enqueueMutation, listLocalCategories, listLocalInventoryItems, listLocalProducts, listLocalSales, listLocalStaffMembers, type LocalCategory, type LocalInventoryItem, type LocalProduct, type LocalSale, type LocalStaffMember, upsertLocalCategories, upsertLocalProducts, upsertLocalStaffMembers, withOfflineDb } from './offlineDb';
+import { enqueueMutation, listLocalCategories, listLocalInventoryItems, listLocalProducts, listLocalSales, listLocalStaffMembers, type LocalCategory, type LocalInventoryItem, type LocalProduct, type LocalSale, type LocalStaffMember, upsertLocalCategories, upsertLocalInventoryItems, upsertLocalProducts, upsertLocalStaffMembers, withOfflineDb } from './offlineDb';
+import { supabase } from '../lib/supabase';
 import { updateTenantPreferences } from './tenantService';
 
 export type TopSeller = {
@@ -37,12 +38,15 @@ export type ProductInput = {
   tenant_id: string;
   category_id: string | null;
   name: string;
+  image_path?: string | null;
+  product_image_uri?: string | null;
   price_cents: number;
   selling_price_cents: number;
   cost_price_cents: number;
   inventory_tracking: boolean;
   stock_count: number;
   linked_inventory_item_id: string | null;
+  linked_inventory_item_ids: string[];
   deduction_multiplier: number;
   active: boolean;
 };
@@ -65,6 +69,15 @@ export type StaffInput = {
   active: boolean;
 };
 
+export type InventoryInput = {
+  id?: string;
+  tenant_id: string;
+  sku: string | null;
+  name: string;
+  quantity: number;
+  unit: string | null;
+};
+
 export type BrandingInput = {
   tenantId: string;
   colorPalette: Parameters<typeof updateTenantPreferences>[1];
@@ -74,6 +87,44 @@ export type BrandingInput = {
 const createLocalId = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
 const nowIso = (): string => new Date().toISOString();
+
+const uploadProductImage = async (tenantId: string, productId: string, imageUri: string): Promise<string> => {
+  if (!supabase) {
+    throw new Error('Supabase is not configured. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY.');
+  }
+
+  const response = await fetch(imageUri);
+  const blob = await response.blob();
+  const extensionMatch = imageUri.toLowerCase().match(/\.(jpg|jpeg|png|webp)(\?|$)/);
+  const extension = extensionMatch?.[1] === 'jpeg' ? 'jpg' : (extensionMatch?.[1] ?? 'jpg');
+  const contentType = extension === 'png' ? 'image/png' : extension === 'webp' ? 'image/webp' : 'image/jpeg';
+  const imagePath = `${tenantId}/products/${productId}-${Date.now()}.${extension}`;
+
+  const { error } = await supabase.storage.from('tenant-assets').upload(imagePath, blob, {
+    contentType,
+    upsert: true,
+  });
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return imagePath;
+};
+
+export const resolveProductImageUrl = async (imagePath: string | null): Promise<string | null> => {
+  if (!supabase || !imagePath) {
+    return null;
+  }
+
+  const { data, error } = await supabase.storage.from('tenant-assets').createSignedUrl(imagePath, 60 * 60 * 24);
+
+  if (error || !data?.signedUrl) {
+    return null;
+  }
+
+  return data.signedUrl;
+};
 
 const startOfDayIso = (): string => {
   const now = new Date();
@@ -178,17 +229,25 @@ export const getAdminSnapshot = async (tenantId: string): Promise<AdminSnapshot>
 
 export const saveProduct = async (input: ProductInput): Promise<void> => {
   const timestamp = nowIso();
+  const productId = input.id ?? createLocalId();
+  const imagePath = input.product_image_uri
+    ? await uploadProductImage(input.tenant_id, productId, input.product_image_uri)
+    : (input.image_path ?? null);
+  const normalizedLinkedIds = Array.from(new Set(input.linked_inventory_item_ids.filter(Boolean)));
+  const primaryLinkedId = normalizedLinkedIds[0] ?? input.linked_inventory_item_id ?? null;
   const product: LocalProduct = {
-    id: input.id ?? createLocalId(),
+    id: productId,
     tenant_id: input.tenant_id,
     category_id: input.category_id,
     name: input.name,
+    image_path: imagePath,
     price_cents: input.price_cents,
     selling_price_cents: input.selling_price_cents,
     cost_price_cents: input.cost_price_cents,
     inventory_tracking: input.inventory_tracking,
     stock_count: input.stock_count,
-    linked_inventory_item_id: input.linked_inventory_item_id,
+    linked_inventory_item_id: primaryLinkedId,
+    linked_inventory_item_ids_json: normalizedLinkedIds.length > 0 ? JSON.stringify(normalizedLinkedIds) : null,
     deduction_multiplier: input.deduction_multiplier,
     active: input.active,
     updated_at: timestamp,
@@ -257,6 +316,22 @@ export const saveStaffMember = async (input: StaffInput): Promise<void> => {
 
   await upsertLocalStaffMembers([staffMember]);
   await enqueueMutation(input.tenant_id, 'UPSERT', 'staff_members', staffMember);
+};
+
+export const saveInventoryItem = async (input: InventoryInput): Promise<void> => {
+  const item: LocalInventoryItem = {
+    id: input.id ?? createLocalId(),
+    tenant_id: input.tenant_id,
+    sku: input.sku,
+    name: input.name,
+    quantity: input.quantity,
+    unit: input.unit,
+    updated_at: nowIso(),
+    deleted_at: null,
+  };
+
+  await upsertLocalInventoryItems([item]);
+  await enqueueMutation(input.tenant_id, 'UPSERT', 'inventory_items', item);
 };
 
 export const deleteStaffMember = async (tenantId: string, staffMember: LocalStaffMember): Promise<void> => {
