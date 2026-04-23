@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { listLocalCategories, listLocalProducts, type LocalCategory, type LocalProduct } from '../../services/offlineDb';
+import { resolveProductImageUrl } from '../../services/adminService';
 import { createSaleLocalFirst, getPosSnapshot, type PosSnapshot } from '../../services/posService';
 import { useAuthStore } from '../../store/authStore';
 import { useThemeStore } from '../../store/themeStore';
@@ -141,6 +142,7 @@ export const PosLandscapeScreen = () => {
   const [chargeOverride, setChargeOverride] = useState<string | null>(null);
   const [clockLabel, setClockLabel] = useState<string>('');
   const [cashTenderInput, setCashTenderInput] = useState<string>('');
+  const [productImageUrlById, setProductImageUrlById] = useState<Record<string, string | null>>({});
   const chargeResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const tenantId = profile?.tenant_id;
@@ -156,7 +158,12 @@ export const PosLandscapeScreen = () => {
       getPosSnapshot(tenantId),
     ]);
 
+    const imagePreviewEntries = await Promise.all(
+      products.map(async (product) => [product.id, await resolveProductImageUrl(product.image_path)] as const)
+    );
+
     setCatalog(buildCatalog(products, categories));
+    setProductImageUrlById(Object.fromEntries(imagePreviewEntries));
     const tabs: CategoryTab[] = [
       { key: 'all', label: 'All' },
       ...categories.filter((category) => category.active).map((category) => ({ key: category.id, label: category.name })),
@@ -483,7 +490,11 @@ export const PosLandscapeScreen = () => {
                       <Text style={[styles.productBadge, { color: palette.primary }]}>✓</Text>
                     </View>
                     <View style={styles.productIconWrap}>
-                      <Text style={styles.productIcon}>{product.icon}</Text>
+                      {productImageUrlById[product.productId ?? ''] ? (
+                        <Image source={{ uri: productImageUrlById[product.productId ?? ''] ?? undefined }} style={styles.productImage} />
+                      ) : (
+                        <Text style={styles.productIcon}>{product.icon}</Text>
+                      )}
                     </View>
                     <Text style={[styles.productName, { color: palette.text }]} numberOfLines={2}>
                       {product.name}
@@ -865,6 +876,11 @@ const styles = StyleSheet.create({
   },
   productIcon: {
     fontSize: 22,
+  },
+  productImage: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 10,
   },
   productName: {
     fontSize: 12.5,

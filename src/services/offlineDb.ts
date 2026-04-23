@@ -155,11 +155,247 @@ type SyncCursorRow = {
 const ISO_MIN_DATE = '1970-01-01T00:00:00.000Z';
 
 const nowIso = (): string => new Date().toISOString();
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const isUuid = (value: string | null | undefined): value is string => typeof value === 'string' && UUID_REGEX.test(value);
 
 const createLocalId = (): string => {
-  const random = Math.random().toString(36).slice(2, 10);
-  return `${Date.now().toString(36)}-${random}`;
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (char) => {
+    const randomNibble = Math.floor(Math.random() * 16);
+    const nibble = char === 'x' ? randomNibble : (randomNibble & 0x3) | 0x8;
+    return nibble.toString(16);
+  });
 };
+  const remapLinkedInventoryJson = (linkedIdsJson: string | null, idMap: Map<string, string>): string | null => {
+    if (!linkedIdsJson) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(linkedIdsJson);
+      if (!Array.isArray(parsed)) {
+        return null;
+      }
+
+      const normalized = Array.from(
+        new Set(
+          parsed
+            .filter((value): value is string => typeof value === 'string' && value.length > 0)
+            .map((value) => idMap.get(value) ?? value)
+            .filter((value) => isUuid(value))
+        )
+      );
+
+      return normalized.length > 0 ? JSON.stringify(normalized) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const remapPayloadIds = (
+    tableName: string,
+    payload: unknown,
+    maps: {
+      productIds: Map<string, string>;
+      categoryIds: Map<string, string>;
+      inventoryIds: Map<string, string>;
+      staffIds: Map<string, string>;
+    }
+  ): unknown => {
+    if (!payload || typeof payload !== 'object') {
+      return payload;
+    }
+
+    const mapOrNull = (value: string | null | undefined, idMap: Map<string, string>): string | null => {
+      if (!value) {
+        return null;
+      }
+
+      const mapped = idMap.get(value) ?? value;
+      return isUuid(mapped) ? mapped : null;
+    };
+
+    if (tableName === 'products') {
+      const row = payload as LocalProduct;
+      return {
+        ...row,
+        id: mapOrNull(row.id, maps.productIds) ?? row.id,
+        category_id: mapOrNull(row.category_id, maps.categoryIds),
+        linked_inventory_item_id: mapOrNull(row.linked_inventory_item_id, maps.inventoryIds),
+        linked_inventory_item_ids_json: remapLinkedInventoryJson(row.linked_inventory_item_ids_json, maps.inventoryIds),
+      };
+    }
+
+    if (tableName === 'inventory_items') {
+      const row = payload as LocalInventoryItem;
+      return {
+        ...row,
+        id: mapOrNull(row.id, maps.inventoryIds) ?? row.id,
+      };
+    }
+
+    if (tableName === 'categories') {
+      const row = payload as LocalCategory;
+      return {
+        ...row,
+        id: mapOrNull(row.id, maps.categoryIds) ?? row.id,
+      };
+    }
+
+    if (tableName === 'staff_members') {
+      const row = payload as LocalStaffMember;
+      return {
+        ...row,
+        id: mapOrNull(row.id, maps.staffIds) ?? row.id,
+      };
+    }
+
+    if (tableName === 'sales') {
+      const salesPayload = payload as {
+        sale: {
+          id: string;
+          cashier_profile_id: string | null;
+        };
+        items: Array<{
+          id: string;
+          sale_id: string;
+          product_id: string | null;
+        }>;
+      };
+
+      return {
+        ...salesPayload,
+        sale: {
+          ...salesPayload.sale,
+          cashier_profile_id: mapOrNull(salesPayload.sale.cashier_profile_id, maps.staffIds),
+        },
+        items: Array.isArray(salesPayload.items)
+          ? salesPayload.items.map((item) => ({
+              ...item,
+              product_id: mapOrNull(item.product_id, maps.productIds),
+            }))
+          : [],
+      };
+    }
+
+    return payload;
+  };
+
+  const migrateLegacyLocalIds = async (db: SQLite.SQLiteDatabase): Promise<void> => {
+    const [
+      productRows,
+      categoryRows,
+      inventoryRows,
+      staffRows,
+      productRefs,
+      saleItemRefs,
+      mutationRows,
+    ] = await Promise.all([
+      db.getAllAsync<{ id: string }>('SELECT id FROM local_products'),
+      db.getAllAsync<{ id: string }>('SELECT id FROM local_categories'),
+      db.getAllAsync<{ id: string }>('SELECT id FROM local_inventory_items'),
+      db.getAllAsync<{ id: string }>('SELECT id FROM local_staff_members'),
+      db.getAllAsync<{ id: string; category_id: string | null; linked_inventory_item_id: string | null; linked_inventory_item_ids_json: string | null }>(
+        'SELECT id, category_id, linked_inventory_item_id, linked_inventory_item_ids_json FROM local_products'
+      ),
+      db.getAllAsync<{ id: string; product_id: string | null }>('SELECT id, product_id FROM local_sale_items'),
+      db.getAllAsync<{ id: string; table_name: string; payload: string }>('SELECT id, table_name, payload FROM pending_mutations'),
+    ]);
+
+    const productIds = new Map(productRows.filter((row) => !isUuid(row.id)).map((row) => [row.id, createLocalId()]));
+    const categoryIds = new Map(categoryRows.filter((row) => !isUuid(row.id)).map((row) => [row.id, createLocalId()]));
+    const inventoryIds = new Map(inventoryRows.filter((row) => !isUuid(row.id)).map((row) => [row.id, createLocalId()]));
+    const staffIds = new Map(staffRows.filter((row) => !isUuid(row.id)).map((row) => [row.id, createLocalId()]));
+
+    const hasAnyTableIdRemap = productIds.size > 0 || categoryIds.size > 0 || inventoryIds.size > 0 || staffIds.size > 0;
+    const hasInvalidReferences =
+      productRefs.some(
+        (row) =>
+          (row.category_id !== null && !isUuid(row.category_id) && !categoryIds.has(row.category_id)) ||
+          (row.linked_inventory_item_id !== null && !isUuid(row.linked_inventory_item_id) && !inventoryIds.has(row.linked_inventory_item_id))
+      ) ||
+      saleItemRefs.some((row) => row.product_id !== null && !isUuid(row.product_id) && !productIds.has(row.product_id));
+
+    if (!hasAnyTableIdRemap && !hasInvalidReferences) {
+      return;
+    }
+
+    await db.withTransactionAsync(async () => {
+      for (const [oldId, newId] of categoryIds.entries()) {
+        await db.runAsync('UPDATE local_categories SET id = ? WHERE id = ?', [newId, oldId]);
+        await db.runAsync('UPDATE local_products SET category_id = ? WHERE category_id = ?', [newId, oldId]);
+      }
+
+      for (const [oldId, newId] of inventoryIds.entries()) {
+        await db.runAsync('UPDATE local_inventory_items SET id = ? WHERE id = ?', [newId, oldId]);
+        await db.runAsync('UPDATE local_products SET linked_inventory_item_id = ? WHERE linked_inventory_item_id = ?', [newId, oldId]);
+      }
+
+      for (const [oldId, newId] of productIds.entries()) {
+        await db.runAsync('UPDATE local_products SET id = ? WHERE id = ?', [newId, oldId]);
+        await db.runAsync('UPDATE local_sale_items SET product_id = ? WHERE product_id = ?', [newId, oldId]);
+      }
+
+      for (const [oldId, newId] of staffIds.entries()) {
+        await db.runAsync('UPDATE local_staff_members SET id = ? WHERE id = ?', [newId, oldId]);
+      }
+
+      for (const row of productRefs) {
+        const nextCategoryId = row.category_id ? categoryIds.get(row.category_id) ?? row.category_id : null;
+        const categoryIdValue = nextCategoryId && isUuid(nextCategoryId) ? nextCategoryId : null;
+
+        const nextLinkedInventoryId = row.linked_inventory_item_id
+          ? inventoryIds.get(row.linked_inventory_item_id) ?? row.linked_inventory_item_id
+          : null;
+        const linkedInventoryIdValue = nextLinkedInventoryId && isUuid(nextLinkedInventoryId) ? nextLinkedInventoryId : null;
+
+        const linkedInventoryJsonValue = remapLinkedInventoryJson(row.linked_inventory_item_ids_json, inventoryIds);
+
+        await db.runAsync(
+          `
+            UPDATE local_products
+            SET category_id = ?,
+                linked_inventory_item_id = ?,
+                linked_inventory_item_ids_json = ?
+            WHERE id = ?
+          `,
+          [categoryIdValue, linkedInventoryIdValue, linkedInventoryJsonValue, productIds.get(row.id) ?? row.id]
+        );
+      }
+
+      for (const row of saleItemRefs) {
+        const nextProductId = row.product_id ? productIds.get(row.product_id) ?? row.product_id : null;
+        const productIdValue = nextProductId && isUuid(nextProductId) ? nextProductId : null;
+
+        await db.runAsync('UPDATE local_sale_items SET product_id = ? WHERE id = ?', [productIdValue, row.id]);
+      }
+
+      for (const mutation of mutationRows) {
+        let parsedPayload: unknown;
+        try {
+          parsedPayload = JSON.parse(mutation.payload);
+        } catch {
+          continue;
+        }
+
+        const remappedPayload = remapPayloadIds(mutation.table_name, parsedPayload, {
+          productIds,
+          categoryIds,
+          inventoryIds,
+          staffIds,
+        });
+
+        const nextPayload = JSON.stringify(remappedPayload);
+        if (nextPayload !== mutation.payload) {
+          await db.runAsync('UPDATE pending_mutations SET payload = ? WHERE id = ?', [nextPayload, mutation.id]);
+        }
+      }
+    });
+  };
+
 
 const getDb = async (): Promise<SQLite.SQLiteDatabase> => {
   if (!dbPromise) {
@@ -431,6 +667,8 @@ export const initializeOfflineDb = async (): Promise<void> => {
     CREATE INDEX IF NOT EXISTS idx_pending_mutations_retry_window
     ON pending_mutations (tenant_id, next_attempt_at, attempts);
   `).catch(() => undefined);
+
+  await migrateLegacyLocalIds(db);
 
   initialized = true;
 };

@@ -110,6 +110,19 @@ let activeTenantId: string | null = null;
 let running = false;
 
 const SYNC_INTERVAL_MS = 8000;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const isUuid = (value: string | null | undefined): value is string => typeof value === 'string' && UUID_REGEX.test(value);
+
+const toValidUuidOrNull = (value: string | null | undefined): string | null => (isUuid(value) ? value : null);
+
+const assertRequiredUuid = (value: string | null | undefined, fieldName: string): string => {
+  if (!isUuid(value)) {
+    throw new Error(`INVALID_LOCAL_UUID:${fieldName}`);
+  }
+
+  return value;
+};
 
 const isTransientNetworkError = (errorMessage: string): boolean => {
   const normalized = errorMessage.toLowerCase();
@@ -119,6 +132,11 @@ const isTransientNetworkError = (errorMessage: string): boolean => {
     normalized.includes('timeout') ||
     normalized.includes('connection')
   );
+};
+
+const isIrrecoverableMutationError = (errorMessage: string): boolean => {
+  const normalized = errorMessage.toLowerCase();
+  return normalized.includes('invalid_local_uuid:') || normalized.includes('invalid input syntax for type uuid');
 };
 
 const parseLinkedInventoryIds = (linkedIdsJson: string | null, fallbackLinkedId: string | null): string[] => {
@@ -230,12 +248,34 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
 
   if (tableName === 'products') {
     const product = payload as LocalProduct;
-    const linkedInventoryIds = parseLinkedInventoryIds(product.linked_inventory_item_ids_json, product.linked_inventory_item_id);
+    const productId = assertRequiredUuid(product.id, 'products.id');
+    const tenantId = assertRequiredUuid(product.tenant_id, 'products.tenant_id');
+    let categoryId = toValidUuidOrNull(product.category_id);
+    const linkedInventoryIds = parseLinkedInventoryIds(product.linked_inventory_item_ids_json, product.linked_inventory_item_id).filter(isUuid);
+    const linkedInventoryItemId = toValidUuidOrNull(product.linked_inventory_item_id);
+
+    if (categoryId) {
+      const { data: categoryRow, error: categoryError } = await supabase
+        .from('categories')
+        .select('id')
+        .eq('tenant_id', tenantId)
+        .eq('id', categoryId)
+        .maybeSingle();
+
+      if (categoryError) {
+        throw new Error(categoryError.message);
+      }
+
+      if (!categoryRow) {
+        categoryId = null;
+      }
+    }
+
     const { error } = await supabase.from('products').upsert(
       {
-        id: product.id,
-        tenant_id: product.tenant_id,
-        category_id: product.category_id,
+        id: productId,
+        tenant_id: tenantId,
+        category_id: categoryId,
         name: product.name,
         image_path: product.image_path,
         price_cents: product.price_cents,
@@ -243,7 +283,7 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
         cost_price_cents: product.cost_price_cents,
         inventory_tracking: product.inventory_tracking,
         stock_count: product.stock_count,
-        linked_inventory_item_id: product.linked_inventory_item_id,
+        linked_inventory_item_id: linkedInventoryItemId,
         deduction_multiplier: product.deduction_multiplier,
         active: product.active,
       },
@@ -257,8 +297,8 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
     const { data: existingLinks, error: linksReadError } = await supabase
       .from('product_inventory_links')
       .select('inventory_item_id, deleted_at')
-      .eq('tenant_id', product.tenant_id)
-      .eq('product_id', product.id);
+      .eq('tenant_id', tenantId)
+      .eq('product_id', productId);
 
     if (linksReadError) {
       throw new Error(linksReadError.message);
@@ -278,8 +318,8 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
           deleted_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         })
-        .eq('tenant_id', product.tenant_id)
-        .eq('product_id', product.id)
+        .eq('tenant_id', tenantId)
+        .eq('product_id', productId)
         .in('inventory_item_id', idsToArchive);
 
       if (archiveError) {
@@ -290,8 +330,8 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
     if (desiredIds.length > 0) {
       const now = new Date().toISOString();
       const linkRows = desiredIds.map((inventoryItemId) => ({
-        tenant_id: product.tenant_id,
-        product_id: product.id,
+        tenant_id: tenantId,
+        product_id: productId,
         inventory_item_id: inventoryItemId,
         updated_at: now,
         deleted_at: null,
@@ -311,10 +351,12 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
 
   if (tableName === 'inventory_items') {
     const item = payload as LocalInventoryItem;
+    const itemId = assertRequiredUuid(item.id, 'inventory_items.id');
+    const tenantId = assertRequiredUuid(item.tenant_id, 'inventory_items.tenant_id');
     const { error } = await supabase.from('inventory_items').upsert(
       {
-        id: item.id,
-        tenant_id: item.tenant_id,
+        id: itemId,
+        tenant_id: tenantId,
         sku: item.sku,
         name: item.name,
         quantity: item.quantity,
@@ -332,12 +374,15 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
 
   if (tableName === 'sales') {
     const salePayload = payload as SaleMutationPayload;
+    const saleId = assertRequiredUuid(salePayload.sale.id, 'sales.id');
+    const tenantId = assertRequiredUuid(salePayload.sale.tenant_id, 'sales.tenant_id');
+    const cashierProfileId = toValidUuidOrNull(salePayload.sale.cashier_profile_id);
 
     const { error: saleError } = await supabase.from('sales').upsert(
       {
-        id: salePayload.sale.id,
-        tenant_id: salePayload.sale.tenant_id,
-        cashier_profile_id: salePayload.sale.cashier_profile_id,
+        id: saleId,
+        tenant_id: tenantId,
+        cashier_profile_id: cashierProfileId,
         total_cents: salePayload.sale.total_cents,
         gross_profit_cents: salePayload.sale.gross_profit_cents,
         expenses_cents: salePayload.sale.expenses_cents,
@@ -353,19 +398,45 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
     }
 
     if (salePayload.items.length > 0) {
+      const sanitizedItems = salePayload.items
+        .map((item) => {
+          if (!isUuid(item.id)) {
+            return null;
+          }
+
+          return {
+            id: item.id,
+            sale_id: saleId,
+            product_id: toValidUuidOrNull(item.product_id),
+            tenant_id: tenantId,
+            quantity: item.quantity,
+            unit_price_cents: item.unit_price_cents,
+            cost_price_cents: item.cost_price_cents,
+            selling_price_cents: item.selling_price_cents,
+            gross_margin_cents: item.gross_margin_cents,
+            created_at: item.created_at,
+          };
+        })
+        .filter((item): item is {
+          id: string;
+          sale_id: string;
+          product_id: string | null;
+          tenant_id: string;
+          quantity: number;
+          unit_price_cents: number;
+          cost_price_cents: number;
+          selling_price_cents: number;
+          gross_margin_cents: number;
+          created_at: string;
+        } => item !== null);
+
+      if (sanitizedItems.length === 0) {
+        await markSaleSynced(saleId);
+        return;
+      }
+
       const { error: saleItemError } = await supabase.from('sale_items').upsert(
-        salePayload.items.map((item) => ({
-          id: item.id,
-          sale_id: item.sale_id,
-          product_id: item.product_id,
-          tenant_id: item.tenant_id,
-          quantity: item.quantity,
-          unit_price_cents: item.unit_price_cents,
-          cost_price_cents: item.cost_price_cents,
-          selling_price_cents: item.selling_price_cents,
-          gross_margin_cents: item.gross_margin_cents,
-          created_at: item.created_at,
-        })),
+        sanitizedItems,
         { onConflict: 'id' }
       );
 
@@ -374,16 +445,18 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
       }
     }
 
-    await markSaleSynced(salePayload.sale.id);
+    await markSaleSynced(saleId);
     return;
   }
 
   if (tableName === 'categories') {
     const category = payload as LocalCategory;
+    const categoryId = assertRequiredUuid(category.id, 'categories.id');
+    const tenantId = assertRequiredUuid(category.tenant_id, 'categories.tenant_id');
     const { error } = await supabase.from('categories').upsert(
       {
-        id: category.id,
-        tenant_id: category.tenant_id,
+        id: categoryId,
+        tenant_id: tenantId,
         name: category.name,
         color: category.color,
         active: category.active,
@@ -403,10 +476,12 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
 
   if (tableName === 'staff_members') {
     const staffMember = payload as LocalStaffMember;
+    const staffId = assertRequiredUuid(staffMember.id, 'staff_members.id');
+    const tenantId = assertRequiredUuid(staffMember.tenant_id, 'staff_members.tenant_id');
     const { error } = await supabase.from('staff_members').upsert(
       {
-        id: staffMember.id,
-        tenant_id: staffMember.tenant_id,
+        id: staffId,
+        tenant_id: tenantId,
         name: staffMember.name,
         role: staffMember.role,
         phone: staffMember.phone,
@@ -443,6 +518,12 @@ const pushPendingMutations = async (tenantId: string): Promise<void> => {
       await markMutationSynced(mutation.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown sync failure';
+
+      if (isIrrecoverableMutationError(message)) {
+        await markMutationSynced(mutation.id);
+        continue;
+      }
+
       await markMutationFailed(mutation.id, message, mutation.attempts + 1);
 
       if (isTransientNetworkError(message)) {

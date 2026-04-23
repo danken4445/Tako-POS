@@ -91,11 +91,14 @@ const uploadTenantLogo = async (tenantId: string, imageUri: string): Promise<str
   }
 
   const response = await fetch(imageUri);
-  const blob = await response.blob();
-  const logoPath = `${tenantId}/logo-${Date.now()}.png`;
+  const logoBytes = await response.arrayBuffer();
+  const responseContentType = response.headers.get('content-type')?.toLowerCase() ?? '';
+  const extension = responseContentType.includes('webp') ? 'webp' : responseContentType.includes('png') ? 'png' : 'jpg';
+  const contentType = extension === 'webp' ? 'image/webp' : extension === 'png' ? 'image/png' : 'image/jpeg';
+  const logoPath = `${tenantId}/logo-${Date.now()}.${extension}`;
 
-  const { error } = await supabase.storage.from('tenant-assets').upload(logoPath, blob, {
-    contentType: 'image/png',
+  const { error } = await supabase.storage.from('tenant-assets').upload(logoPath, logoBytes, {
+    contentType,
     upsert: true,
   });
 

@@ -446,7 +446,7 @@ export const AdminDashboardScreen = () => {
     }
 
     try {
-      await saveProduct({
+      const saveResult = await saveProduct({
         ...productForm,
         tenant_id: tenantId,
         image_path: productForm.image_path ?? null,
@@ -462,7 +462,11 @@ export const AdminDashboardScreen = () => {
         active: Boolean(productForm.active),
       });
 
-      setStatusMessage('Product saved and queued for sync.');
+      setStatusMessage(
+        saveResult.imageUploadError
+          ? 'Product saved and queued for sync. Image was not uploaded; re-save the image when online.'
+          : 'Product saved and queued for sync.'
+      );
       clearProductEdit();
       await loadSnapshot();
     } catch (error) {
@@ -612,7 +616,7 @@ export const AdminDashboardScreen = () => {
 
   const handlePickLogo = async () => {
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      mediaTypes: ['images'],
       quality: 0.9,
       allowsMultipleSelection: false,
     });
@@ -626,7 +630,7 @@ export const AdminDashboardScreen = () => {
 
   const handlePickProductImage = async () => {
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      mediaTypes: ['images'],
       quality: 0.85,
       allowsMultipleSelection: false,
     });

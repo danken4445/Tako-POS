@@ -51,6 +51,10 @@ export type ProductInput = {
   active: boolean;
 };
 
+export type SaveProductResult = {
+  imageUploadError: string | null;
+};
+
 export type CategoryInput = {
   id?: string;
   tenant_id: string;
@@ -84,7 +88,17 @@ export type BrandingInput = {
   logoImageUri?: string | null;
 };
 
-const createLocalId = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+const createLocalId = (): string => {
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (char) => {
+    const randomNibble = Math.floor(Math.random() * 16);
+    const nibble = char === 'x' ? randomNibble : (randomNibble & 0x3) | 0x8;
+    return nibble.toString(16);
+  });
+};
 
 const nowIso = (): string => new Date().toISOString();
 
@@ -94,13 +108,15 @@ const uploadProductImage = async (tenantId: string, productId: string, imageUri:
   }
 
   const response = await fetch(imageUri);
-  const blob = await response.blob();
+  const imageBytes = await response.arrayBuffer();
+  const responseContentType = response.headers.get('content-type')?.toLowerCase() ?? '';
   const extensionMatch = imageUri.toLowerCase().match(/\.(jpg|jpeg|png|webp)(\?|$)/);
-  const extension = extensionMatch?.[1] === 'jpeg' ? 'jpg' : (extensionMatch?.[1] ?? 'jpg');
+  const normalizedExt = extensionMatch?.[1] === 'jpeg' ? 'jpg' : extensionMatch?.[1];
+  const extension = normalizedExt ?? (responseContentType.includes('png') ? 'png' : responseContentType.includes('webp') ? 'webp' : 'jpg');
   const contentType = extension === 'png' ? 'image/png' : extension === 'webp' ? 'image/webp' : 'image/jpeg';
   const imagePath = `${tenantId}/products/${productId}-${Date.now()}.${extension}`;
 
-  const { error } = await supabase.storage.from('tenant-assets').upload(imagePath, blob, {
+  const { error } = await supabase.storage.from('tenant-assets').upload(imagePath, imageBytes, {
     contentType,
     upsert: true,
   });
@@ -113,7 +129,15 @@ const uploadProductImage = async (tenantId: string, productId: string, imageUri:
 };
 
 export const resolveProductImageUrl = async (imagePath: string | null): Promise<string | null> => {
-  if (!supabase || !imagePath) {
+  if (!imagePath) {
+    return null;
+  }
+
+  if (/^https?:\/\//i.test(imagePath)) {
+    return imagePath;
+  }
+
+  if (!supabase) {
     return null;
   }
 
@@ -227,12 +251,20 @@ export const getAdminSnapshot = async (tenantId: string): Promise<AdminSnapshot>
   };
 };
 
-export const saveProduct = async (input: ProductInput): Promise<void> => {
+export const saveProduct = async (input: ProductInput): Promise<SaveProductResult> => {
   const timestamp = nowIso();
   const productId = input.id ?? createLocalId();
-  const imagePath = input.product_image_uri
-    ? await uploadProductImage(input.tenant_id, productId, input.product_image_uri)
-    : (input.image_path ?? null);
+  let imagePath = input.image_path ?? null;
+  let imageUploadError: string | null = null;
+
+  if (input.product_image_uri) {
+    try {
+      imagePath = await uploadProductImage(input.tenant_id, productId, input.product_image_uri);
+    } catch (error) {
+      imageUploadError = error instanceof Error ? error.message : 'Image upload failed';
+    }
+  }
+
   const normalizedLinkedIds = Array.from(new Set(input.linked_inventory_item_ids.filter(Boolean)));
   const primaryLinkedId = normalizedLinkedIds[0] ?? input.linked_inventory_item_id ?? null;
   const product: LocalProduct = {
@@ -256,6 +288,10 @@ export const saveProduct = async (input: ProductInput): Promise<void> => {
 
   await upsertLocalProducts([product]);
   await enqueueMutation(input.tenant_id, 'UPSERT', 'products', product);
+
+  return {
+    imageUploadError,
+  };
 };
 
 export const deleteProduct = async (tenantId: string, product: LocalProduct): Promise<void> => {
