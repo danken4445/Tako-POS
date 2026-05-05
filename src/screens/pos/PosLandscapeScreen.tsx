@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Image, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { listLocalCategories, listLocalProducts, type LocalCategory, type LocalProduct } from '../../services/offlineDb';
 import { resolveProductImageUrl } from '../../services/adminService';
 import { createSaleLocalFirst, getPosSnapshot, type PosSnapshot } from '../../services/posService';
+import { closeShift, getShiftSummary, loadActiveShift, openShift, recordShiftEvent, type ShiftSummary } from '../../services/shiftService';
+import { openCashDrawer, printZReport } from '../../services/posHardware';
 import { useAuthStore } from '../../store/authStore';
 import { useThemeStore } from '../../store/themeStore';
 
@@ -32,6 +34,7 @@ type CategoryTab = {
 };
 
 const CASH_BILLS = [1000, 500, 100, 50, 20, 10];
+const DENOMINATIONS = [1000, 500, 200, 100, 50, 20, 10, 5, 1];
 const TAX_RATE = 0.08;
 
 const phpFormatter = new Intl.NumberFormat('en-PH', {
@@ -42,6 +45,31 @@ const phpFormatter = new Intl.NumberFormat('en-PH', {
 });
 
 const money = (cents: number): string => phpFormatter.format(cents / 100);
+
+const formatCentsAsPesoInput = (cents: number): string => (Math.max(0, cents) / 100).toFixed(2);
+
+const normalizeCurrencyInput = (value: string): string => {
+  const sanitized = value.replace(/[^0-9.]/g, '');
+  const [whole, ...rest] = sanitized.split('.');
+  const decimal = rest.join('');
+
+  if (!sanitized.includes('.')) {
+    return whole;
+  }
+
+  return `${whole}.${decimal.slice(0, 2)}`;
+};
+
+const parsePesoInputToCents = (value: string): number => {
+  const normalized = normalizeCurrencyInput(value);
+  const parsed = Number(normalized);
+
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.round(parsed * 100));
+};
 
 const normalize = (value: string): string => value.toLowerCase().replace(/[^a-z0-9]+/g, ' ');
 
@@ -143,6 +171,20 @@ export const PosLandscapeScreen = () => {
   const [clockLabel, setClockLabel] = useState<string>('');
   const [cashTenderInput, setCashTenderInput] = useState<string>('');
   const [productImageUrlById, setProductImageUrlById] = useState<Record<string, string | null>>({});
+  const [activeShift, setActiveShift] = useState<Awaited<ReturnType<typeof loadActiveShift>>>(null);
+  const [shiftSummary, setShiftSummary] = useState<ShiftSummary | null>(null);
+  const [showOpeningModal, setShowOpeningModal] = useState(false);
+  const [openingCashInput, setOpeningCashInput] = useState('');
+  const [openingError, setOpeningError] = useState<string | null>(null);
+  const [showPayInOutModal, setShowPayInOutModal] = useState(false);
+  const [payInOutType, setPayInOutType] = useState<'pay_in' | 'pay_out'>('pay_in');
+  const [payInOutAmount, setPayInOutAmount] = useState('');
+  const [payInOutReason, setPayInOutReason] = useState('');
+  const [payInOutError, setPayInOutError] = useState<string | null>(null);
+  const [showEodModal, setShowEodModal] = useState(false);
+  const [denominationCounts, setDenominationCounts] = useState<Record<number, string>>(
+    Object.fromEntries(DENOMINATIONS.map((value) => [value, '0'])) as Record<number, string>
+  );
   const chargeResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const tenantId = profile?.tenant_id;
@@ -179,9 +221,32 @@ export const PosLandscapeScreen = () => {
     setFeedbackMessage(feedbackMessage ?? (products.length > 0 ? 'Local data is ready.' : 'No local products found in database.'));
   }, [tenantId]);
 
+  const loadShiftState = useCallback(async () => {
+    if (!tenantId) {
+      return;
+    }
+
+    const currentShift = await loadActiveShift(tenantId);
+    setActiveShift(currentShift);
+
+    if (!currentShift) {
+      setShiftSummary(null);
+      setShowOpeningModal(true);
+      return;
+    }
+
+    const summary = await getShiftSummary(currentShift);
+    setShiftSummary(summary);
+    setShowOpeningModal(false);
+  }, [tenantId]);
+
   useEffect(() => {
     void loadPosData();
   }, [loadPosData]);
+
+  useEffect(() => {
+    void loadShiftState();
+  }, [loadShiftState]);
 
   useEffect(() => {
     const updateClock = () => {
@@ -262,6 +327,18 @@ export const PosLandscapeScreen = () => {
 
   const changeDueCents = useMemo(() => Math.max(0, cashTenderCents - totals.grandTotalCents), [cashTenderCents, totals.grandTotalCents]);
 
+  const actualCashCents = useMemo(() => {
+    return DENOMINATIONS.reduce((sum, denomination) => {
+      const rawCount = denominationCounts[denomination] ?? '0';
+      const count = Number(rawCount.replace(/[^0-9]/g, '')) || 0;
+      return sum + denomination * 100 * count;
+    }, 0);
+  }, [denominationCounts]);
+
+  const expectedCashCents = shiftSummary?.expectedCashCents ?? 0;
+  const varianceCents = actualCashCents - expectedCashCents;
+  const varianceColor = varianceCents === 0 ? palette.success : varianceCents < 0 ? palette.danger : palette.accent;
+
   const handleAddProduct = useCallback((product: CatalogItem) => {
     setCart((current) => {
       const existing = current[product.key];
@@ -302,6 +379,108 @@ export const PosLandscapeScreen = () => {
     const normalized = value.replace(/[^0-9]/g, '');
     setCashTenderInput(normalized);
   }, []);
+
+  const handleOpenShift = useCallback(async () => {
+    if (!tenantId) {
+      return;
+    }
+
+    const startingCashCents = parsePesoInputToCents(openingCashInput);
+    if (!openingCashInput.trim()) {
+      setOpeningError('Starting cash is required.');
+      return;
+    }
+
+    setOpeningError(null);
+    await openShift({
+      tenantId,
+      cashierProfileId: profile?.id ?? null,
+      startingCashCents,
+    });
+
+    setOpeningCashInput('');
+    await loadShiftState();
+  }, [loadShiftState, openingCashInput, profile?.id, tenantId]);
+
+  const handleRecordPayInOut = useCallback(async () => {
+    if (!tenantId || !activeShift) {
+      return;
+    }
+
+    const amountCents = parsePesoInputToCents(payInOutAmount);
+    if (!payInOutAmount.trim() || amountCents <= 0) {
+      setPayInOutError('Enter a valid amount.');
+      return;
+    }
+
+    setPayInOutError(null);
+    await recordShiftEvent({
+      shiftId: activeShift.id,
+      tenantId,
+      cashierProfileId: profile?.id ?? null,
+      type: payInOutType,
+      amountCents,
+      reason: payInOutReason.trim() || (payInOutType === 'pay_in' ? 'Pay-in' : 'Payout'),
+    });
+
+    setPayInOutAmount('');
+    setPayInOutReason('');
+    setShowPayInOutModal(false);
+    await loadShiftState();
+  }, [activeShift, loadShiftState, payInOutAmount, payInOutReason, payInOutType, profile?.id, tenantId]);
+
+  const handleCloseShift = useCallback(async () => {
+    if (!tenantId || !activeShift || !shiftSummary) {
+      return;
+    }
+
+    const breakdown = Object.fromEntries(
+      DENOMINATIONS.map((value) => [
+        String(value),
+        Number((denominationCounts[value] ?? '0').replace(/[^0-9]/g, '')) || 0,
+      ])
+    );
+
+    await closeShift({
+      shift: activeShift,
+      summary: shiftSummary,
+      actualCashCents,
+      denominationBreakdown: breakdown,
+    });
+
+    const reportLines = [
+      'TAKOPOS Z-REPORT',
+      `Shift: ${activeShift.id.slice(0, 8).toUpperCase()}`,
+      `Opened: ${new Date(activeShift.opened_at).toLocaleString('en-PH')}`,
+      `Closed: ${new Date().toLocaleString('en-PH')}`,
+      `Starting Float: ${money(shiftSummary.startingCashCents)}`,
+      `Cash Sales: ${money(shiftSummary.totalCashSalesCents)}`,
+      `Card Sales: ${money(shiftSummary.paymentsSummary.card)}`,
+      `QR Sales: ${money(shiftSummary.paymentsSummary.qr)}`,
+      `Pay-ins: ${money(shiftSummary.payInsCents)}`,
+      `Payouts: ${money(shiftSummary.payoutsCents)}`,
+      `Expected Cash: ${money(expectedCashCents)}`,
+      `Actual Cash: ${money(actualCashCents)}`,
+      `Variance: ${money(varianceCents)}`,
+    ];
+
+    void printZReport(reportLines.join('\n'));
+    void openCashDrawer();
+
+    setDenominationCounts(Object.fromEntries(DENOMINATIONS.map((value) => [value, '0'])) as Record<number, string>);
+    setShowEodModal(false);
+    await loadShiftState();
+    setFeedbackMessage('Shift closed. Opening float required for the next shift.');
+  }, [
+    activeShift,
+    actualCashCents,
+    denominationCounts,
+    expectedCashCents,
+    loadShiftState,
+    shiftSummary,
+    tenantId,
+    varianceCents,
+  ]);
 
   const handleUpdateQuantity = useCallback((key: string, delta: number) => {
     setCart((current) => {
@@ -346,6 +525,11 @@ export const PosLandscapeScreen = () => {
       return;
     }
 
+    if (!activeShift) {
+      setFeedbackMessage('Open a shift before processing transactions.');
+      return;
+    }
+
     if (paymentMethod === 'cash' && cashTenderCents < totals.grandTotalCents) {
       setFeedbackMessage('Cash received is less than the total due.');
       return;
@@ -357,6 +541,7 @@ export const PosLandscapeScreen = () => {
         cashier_profile_id: profile?.id ?? null,
         total_cents: totals.grandTotalCents,
         expenses_cents: 0,
+        payment_method: paymentMethod,
         items: cartLines.map((line) => ({
           tenant_id: tenantId,
           product_id: line.productId,
@@ -385,10 +570,11 @@ export const PosLandscapeScreen = () => {
       }, 2000);
 
       await loadPosData('Sale saved locally and queued for sync.');
+      await loadShiftState();
     } catch (error) {
       setFeedbackMessage(error instanceof Error ? error.message : 'Failed to save local sale');
     }
-  }, [cashTenderCents, cartLines, changeDueCents, loadPosData, paymentMethod, profile?.id, tenantId, totals.grandTotalCents]);
+  }, [activeShift, cashTenderCents, cartLines, changeDueCents, loadPosData, loadShiftState, paymentMethod, profile?.id, tenantId, totals.grandTotalCents]);
 
   const chargeLabel = chargeOverride ?? `Charge ${money(totals.grandTotalCents)}`;
   const catalogCount = snapshot?.productsCount ?? catalog.length;
@@ -544,6 +730,58 @@ export const PosLandscapeScreen = () => {
             </View>
           </View>
 
+          <View style={[styles.shiftCard, { borderColor: `${palette.text}12`, backgroundColor: `${palette.background}F2` }]}>
+            <View style={styles.shiftHeaderRow}>
+              <Text style={[styles.shiftTitle, { color: palette.text }]}>Shift Status</Text>
+              <Text style={[styles.shiftBadge, { color: activeShift ? palette.success : palette.danger }]}>
+                {activeShift ? 'Open' : 'Closed'}
+              </Text>
+            </View>
+            {activeShift ? (
+              <>
+                <Text style={[styles.shiftMeta, { color: palette.mutedText }]}>Opened {new Date(activeShift.opened_at).toLocaleTimeString('en-PH')}</Text>
+                <View style={styles.shiftTotalsRow}>
+                  <Text style={[styles.shiftLabel, { color: palette.mutedText }]}>Starting Float</Text>
+                  <Text style={[styles.shiftValue, { color: palette.text }]}>{money(shiftSummary?.startingCashCents ?? 0)}</Text>
+                </View>
+                <View style={styles.shiftTotalsRow}>
+                  <Text style={[styles.shiftLabel, { color: palette.mutedText }]}>Expected Cash</Text>
+                  <Text style={[styles.shiftValue, { color: palette.text }]}>{money(expectedCashCents)}</Text>
+                </View>
+              </>
+            ) : (
+              <Text style={[styles.shiftMeta, { color: palette.mutedText }]}>Open a shift to start taking orders.</Text>
+            )}
+            <View style={styles.shiftActionRow}>
+              <Pressable
+                onPress={() => setShowPayInOutModal(true)}
+                disabled={!activeShift}
+                style={({ pressed }) => [
+                  styles.shiftActionButton,
+                  {
+                    borderColor: `${palette.text}22`,
+                    opacity: pressed ? 0.86 : activeShift ? 1 : 0.4,
+                  },
+                ]}
+              >
+                <Text style={[styles.shiftActionText, { color: palette.text }]}>Pay-in / Payout</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => setShowEodModal(true)}
+                disabled={!activeShift}
+                style={({ pressed }) => [
+                  styles.shiftCloseButton,
+                  {
+                    backgroundColor: activeShift ? palette.accent : `${palette.accent}66`,
+                    opacity: pressed ? 0.9 : 1,
+                  },
+                ]}
+              >
+                <Text style={styles.shiftCloseText}>Close Register</Text>
+              </Pressable>
+            </View>
+          </View>
+
           <View style={styles.orderItemsArea}>
             {cartLines.length === 0 ? (
               <View style={styles.emptyOrderState}>
@@ -681,11 +919,11 @@ export const PosLandscapeScreen = () => {
               style={[
                 styles.chargeButton,
                 {
-                  backgroundColor: totals.grandTotalCents > 0 ? palette.primary : `${palette.primary}66`,
+                  backgroundColor: totals.grandTotalCents > 0 && activeShift ? palette.primary : `${palette.primary}66`,
                 },
               ]}
               onPress={handleCharge}
-              disabled={totals.grandTotalCents <= 0}
+              disabled={totals.grandTotalCents <= 0 || !activeShift}
             >
               <Text style={styles.chargeButtonGlyph}>→</Text>
               <Text style={styles.chargeButtonText}>{paymentMethod === 'cash' ? `Charge ${money(totals.grandTotalCents)} • Change ${money(changeDueCents)}` : chargeLabel}</Text>
@@ -695,6 +933,160 @@ export const PosLandscapeScreen = () => {
           </View>
         </View>
       </View>
+
+      <Modal visible={showOpeningModal} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalCard, { backgroundColor: palette.surface }]}>
+            <Text style={[styles.modalTitle, { color: palette.text }]}>Opening Float</Text>
+            <Text style={[styles.modalHint, { color: palette.mutedText }]}>Enter the starting cash for this shift to unlock the register.</Text>
+            <TextInput
+              style={[styles.modalInput, { color: palette.text, borderColor: `${palette.text}22`, backgroundColor: palette.background }]}
+              value={openingCashInput}
+              onChangeText={(value) => {
+                setOpeningCashInput(normalizeCurrencyInput(value));
+                setOpeningError(null);
+              }}
+              placeholder="0.00"
+              placeholderTextColor={palette.mutedText}
+              keyboardType="decimal-pad"
+            />
+            {openingError ? <Text style={[styles.modalError, { color: palette.danger }]}>{openingError}</Text> : null}
+            <Pressable style={[styles.primaryModalButton, { backgroundColor: palette.primary }]} onPress={handleOpenShift}>
+              <Text style={styles.primaryModalText}>Start Shift</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={showPayInOutModal} transparent animationType="fade" onRequestClose={() => setShowPayInOutModal(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalCard, { backgroundColor: palette.surface }]}>
+            <Text style={[styles.modalTitle, { color: palette.text }]}>Pay-in / Payout</Text>
+            <Text style={[styles.modalHint, { color: palette.mutedText }]}>Log mid-day cash adjustments to keep the drawer balanced.</Text>
+            <View style={styles.toggleRow}>
+              {([
+                { key: 'pay_in', label: 'Pay-in' },
+                { key: 'pay_out', label: 'Payout' },
+              ] as const).map((option) => {
+                const active = payInOutType === option.key;
+                return (
+                  <Pressable
+                    key={option.key}
+                    onPress={() => setPayInOutType(option.key)}
+                    style={[
+                      styles.toggleChip,
+                      {
+                        borderColor: active ? palette.primary : `${palette.text}22`,
+                        backgroundColor: active ? `${palette.primary}22` : `${palette.surface}CC`,
+                      },
+                    ]}
+                  >
+                    <Text style={[styles.toggleChipText, { color: active ? palette.primary : palette.mutedText }]}>{option.label}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <TextInput
+              style={[styles.modalInput, { color: palette.text, borderColor: `${palette.text}22`, backgroundColor: palette.background }]}
+              value={payInOutAmount}
+              onChangeText={(value) => {
+                setPayInOutAmount(normalizeCurrencyInput(value));
+                setPayInOutError(null);
+              }}
+              placeholder="Amount"
+              placeholderTextColor={palette.mutedText}
+              keyboardType="decimal-pad"
+            />
+            <TextInput
+              style={[styles.modalInput, { color: palette.text, borderColor: `${palette.text}22`, backgroundColor: palette.background }]}
+              value={payInOutReason}
+              onChangeText={setPayInOutReason}
+              placeholder="Reason (e.g., Bought ice)"
+              placeholderTextColor={palette.mutedText}
+            />
+            {payInOutError ? <Text style={[styles.modalError, { color: palette.danger }]}>{payInOutError}</Text> : null}
+            <View style={styles.modalActionRow}>
+              <Pressable style={[styles.ghostModalButton, { borderColor: `${palette.text}22` }]} onPress={() => setShowPayInOutModal(false)}>
+                <Text style={[styles.ghostModalText, { color: palette.text }]}>Cancel</Text>
+              </Pressable>
+              <Pressable style={[styles.primaryModalButton, { backgroundColor: palette.primary }]} onPress={handleRecordPayInOut}>
+                <Text style={styles.primaryModalText}>Save</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={showEodModal} transparent animationType="slide" onRequestClose={() => setShowEodModal(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.eodCard, { backgroundColor: palette.surface }]}>
+            <Text style={[styles.modalTitle, { color: palette.text }]}>End-of-Day Reconciliation</Text>
+            <Text style={[styles.modalHint, { color: palette.mutedText }]}>Count the drawer and confirm the totals before closing the shift.</Text>
+
+            <View style={[styles.eodSummaryCard, { backgroundColor: `${palette.background}F0`, borderColor: `${palette.text}12` }]}
+            >
+              <View style={styles.eodRow}>
+                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Expected Cash</Text>
+                <Text style={[styles.eodValue, { color: palette.text }]}>{money(expectedCashCents)}</Text>
+              </View>
+              <View style={styles.eodRow}>
+                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Actual Cash</Text>
+                <Text style={[styles.eodValue, { color: palette.text }]}>{money(actualCashCents)}</Text>
+              </View>
+              <View style={styles.eodRow}>
+                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Variance</Text>
+                <Text style={[styles.eodValue, { color: varianceColor }]}>{money(varianceCents)}</Text>
+              </View>
+            </View>
+
+            <Text style={[styles.sectionLabel, { color: palette.mutedText }]}>Denomination Count</Text>
+            <View style={styles.denominationGrid}>
+              {DENOMINATIONS.map((value) => (
+                <View key={value} style={[styles.denominationCell, { borderColor: `${palette.text}12`, backgroundColor: `${palette.background}F2` }]}
+                >
+                  <Text style={[styles.denominationLabel, { color: palette.mutedText }]}>{money(value * 100)}</Text>
+                  <TextInput
+                    style={[styles.denominationInput, { color: palette.text, borderColor: `${palette.text}22` }]}
+                    keyboardType="number-pad"
+                    value={denominationCounts[value] ?? '0'}
+                    onChangeText={(nextValue) =>
+                      setDenominationCounts((current) => ({
+                        ...current,
+                        [value]: nextValue.replace(/[^0-9]/g, '') || '0',
+                      }))
+                    }
+                  />
+                </View>
+              ))}
+            </View>
+
+            <Text style={[styles.sectionLabel, { color: palette.mutedText }]}>Sales Summary</Text>
+            <View style={[styles.eodSummaryCard, { backgroundColor: `${palette.background}F0`, borderColor: `${palette.text}12` }]}>
+              <View style={styles.eodRow}>
+                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Cash Sales</Text>
+                <Text style={[styles.eodValue, { color: palette.text }]}>{money(shiftSummary?.totalCashSalesCents ?? 0)}</Text>
+              </View>
+              <View style={styles.eodRow}>
+                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Card Sales</Text>
+                <Text style={[styles.eodValue, { color: palette.text }]}>{money(shiftSummary?.paymentsSummary.card ?? 0)}</Text>
+              </View>
+              <View style={styles.eodRow}>
+                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>QR Sales</Text>
+                <Text style={[styles.eodValue, { color: palette.text }]}>{money(shiftSummary?.paymentsSummary.qr ?? 0)}</Text>
+              </View>
+            </View>
+
+            <View style={styles.modalActionRow}>
+              <Pressable style={[styles.ghostModalButton, { borderColor: `${palette.text}22` }]} onPress={() => setShowEodModal(false)}>
+                <Text style={[styles.ghostModalText, { color: palette.text }]}>Back</Text>
+              </Pressable>
+              <Pressable style={[styles.primaryModalButton, { backgroundColor: palette.accent }]} onPress={handleCloseShift}>
+                <Text style={styles.primaryModalText}>Confirm Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 };
@@ -746,6 +1138,195 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: '800',
+  },
+  shiftCard: {
+    marginTop: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 12,
+    padding: 12,
+    gap: 8,
+  },
+  shiftHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  shiftTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  shiftBadge: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  shiftMeta: {
+    fontSize: 12,
+  },
+  shiftTotalsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  shiftLabel: {
+    fontSize: 12,
+  },
+  shiftValue: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  shiftActionRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 6,
+  },
+  shiftActionButton: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: 'center',
+  },
+  shiftActionText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  shiftCloseButton: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  shiftCloseText: {
+    color: '#0b0b0b',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(12,14,20,0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  modalCard: {
+    width: '100%',
+    maxWidth: 420,
+    borderRadius: 16,
+    padding: 18,
+    gap: 10,
+  },
+  eodCard: {
+    width: '100%',
+    maxWidth: 520,
+    borderRadius: 18,
+    padding: 18,
+    gap: 12,
+    maxHeight: '90%',
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  modalHint: {
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  modalInput: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 14,
+  },
+  modalError: {
+    fontSize: 12,
+  },
+  modalActionRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 4,
+  },
+  primaryModalButton: {
+    flex: 1,
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  primaryModalText: {
+    color: '#0b0b0b',
+    fontWeight: '700',
+  },
+  ghostModalButton: {
+    flex: 1,
+    borderRadius: 10,
+    paddingVertical: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: 'center',
+  },
+  ghostModalText: {
+    fontWeight: '600',
+  },
+  toggleRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  toggleChip: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: 'center',
+  },
+  toggleChipText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  eodSummaryCard: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 12,
+    padding: 12,
+    gap: 8,
+  },
+  eodRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  eodLabel: {
+    fontSize: 12,
+  },
+  eodValue: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  sectionLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+  },
+  denominationGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  denominationCell: {
+    width: '30%',
+    minWidth: 90,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 10,
+    padding: 10,
+    gap: 6,
+  },
+  denominationLabel: {
+    fontSize: 11,
+  },
+  denominationInput: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+    fontSize: 13,
   },
   sidebarDivider: {
     width: 32,

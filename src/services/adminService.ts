@@ -1,4 +1,22 @@
-import { enqueueMutation, listLocalCategories, listLocalInventoryItems, listLocalProducts, listLocalSales, listLocalStaffMembers, type LocalCategory, type LocalInventoryItem, type LocalProduct, type LocalSale, type LocalStaffMember, upsertLocalCategories, upsertLocalInventoryItems, upsertLocalProducts, upsertLocalStaffMembers, withOfflineDb } from './offlineDb';
+import {
+  clearTenantLocalData,
+  enqueueMutation,
+  listLocalCategories,
+  listLocalInventoryItems,
+  listLocalProducts,
+  listLocalSales,
+  listLocalStaffMembers,
+  upsertLocalCategories,
+  upsertLocalInventoryItems,
+  upsertLocalProducts,
+  upsertLocalStaffMembers,
+  withOfflineDb,
+  type LocalCategory,
+  type LocalInventoryItem,
+  type LocalProduct,
+  type LocalSale,
+  type LocalStaffMember,
+} from './offlineDb';
 import { supabase } from '../lib/supabase';
 import { updateTenantPreferences } from './tenantService';
 
@@ -25,12 +43,59 @@ export type AdminOverview = {
   topSellers: TopSeller[];
 };
 
+export type TransactionHistoryItem = {
+  id: string;
+  saleId: string;
+  productId: string | null;
+  productName: string;
+  quantity: number;
+  unitPriceCents: number;
+  costPriceCents: number;
+  sellingPriceCents: number;
+  grossMarginCents: number;
+  createdAt: string;
+};
+
+export type TransactionHistorySale = {
+  id: string;
+  tenantId: string;
+  cashierProfileId: string | null;
+  totalCents: number;
+  grossProfitCents: number;
+  expensesCents: number;
+  netProfitCents: number;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  syncedAt: string | null;
+  items: TransactionHistoryItem[];
+};
+
+export type ShiftReport = {
+  id: string;
+  tenantId: string;
+  cashierProfileId: string | null;
+  startingCashCents: number;
+  totalCashSalesCents: number;
+  cashRefundsCents: number;
+  payInsCents: number;
+  payoutsCents: number;
+  expectedCashCents: number;
+  actualCashCents: number;
+  varianceCents: number;
+  denominationBreakdown: Record<string, number>;
+  paymentsSummary: Record<string, number>;
+  createdAt: string;
+};
+
 export type AdminSnapshot = {
   overview: AdminOverview;
   products: LocalProduct[];
   inventoryItems: LocalInventoryItem[];
   categories: LocalCategory[];
   staffMembers: LocalStaffMember[];
+  transactions: TransactionHistorySale[];
+  shiftReports: ShiftReport[];
 };
 
 export type ProductInput = {
@@ -184,14 +249,123 @@ const summarizePeriod = (sales: LocalSale[]): PeriodKpi => {
   };
 };
 
+export const listShiftReports = async (tenantId: string): Promise<ShiftReport[]> => {
+  if (!supabase) {
+    return [];
+  }
+
+  const { data, error } = await supabase
+    .from('shift_reports')
+    .select(
+      'id, tenant_id, cashier_profile_id, starting_cash_cents, total_cash_sales_cents, cash_refunds_cents, pay_ins_cents, payouts_cents, expected_cash_cents, actual_cash_cents, variance_cents, denomination_breakdown, payments_summary, created_at'
+    )
+    .eq('tenant_id', tenantId)
+    .order('created_at', { ascending: false })
+    .limit(200);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return (data ?? []).map((row) => ({
+    id: row.id as string,
+    tenantId: row.tenant_id as string,
+    cashierProfileId: (row.cashier_profile_id as string | null) ?? null,
+    startingCashCents: Number(row.starting_cash_cents ?? 0),
+    totalCashSalesCents: Number(row.total_cash_sales_cents ?? 0),
+    cashRefundsCents: Number(row.cash_refunds_cents ?? 0),
+    payInsCents: Number(row.pay_ins_cents ?? 0),
+    payoutsCents: Number(row.payouts_cents ?? 0),
+    expectedCashCents: Number(row.expected_cash_cents ?? 0),
+    actualCashCents: Number(row.actual_cash_cents ?? 0),
+    varianceCents: Number(row.variance_cents ?? 0),
+    denominationBreakdown: (row.denomination_breakdown as Record<string, number>) ?? {},
+    paymentsSummary: (row.payments_summary as Record<string, number>) ?? {},
+    createdAt: row.created_at as string,
+  }));
+};
+
 export const getAdminSnapshot = async (tenantId: string): Promise<AdminSnapshot> => {
-  const [products, inventoryItems, categories, staffMembers, sales] = await Promise.all([
+  const [products, inventoryItems, categories, staffMembers, sales, shiftReports] = await Promise.all([
     listLocalProducts(tenantId),
     listLocalInventoryItems(tenantId),
     listLocalCategories(tenantId),
     listLocalStaffMembers(tenantId),
     listLocalSales(tenantId, 5000),
+    listShiftReports(tenantId).catch(() => []),
   ]);
+
+  const saleItems = await withOfflineDb(async (db) => {
+    return db.getAllAsync<{
+      id: string;
+      sale_id: string;
+      product_id: string | null;
+      product_name: string;
+      quantity: number;
+      unit_price_cents: number;
+      cost_price_cents: number;
+      selling_price_cents: number;
+      gross_margin_cents: number;
+      created_at: string;
+    }>(
+      `
+        SELECT
+          i.id as id,
+          i.sale_id as sale_id,
+          i.product_id as product_id,
+          COALESCE(p.name, 'Unlinked item') as product_name,
+          i.quantity as quantity,
+          i.unit_price_cents as unit_price_cents,
+          i.cost_price_cents as cost_price_cents,
+          i.selling_price_cents as selling_price_cents,
+          i.gross_margin_cents as gross_margin_cents,
+          i.created_at as created_at
+        FROM local_sale_items i
+        LEFT JOIN local_products p ON p.id = i.product_id
+        WHERE i.tenant_id = ?
+        ORDER BY i.created_at DESC, i.id DESC
+        LIMIT 20000
+      `,
+      [tenantId]
+    );
+  });
+
+  const itemsBySaleId = saleItems.reduce<Record<string, TransactionHistoryItem[]>>((accumulator, item) => {
+    const nextItem: TransactionHistoryItem = {
+      id: item.id,
+      saleId: item.sale_id,
+      productId: item.product_id,
+      productName: item.product_name,
+      quantity: Number(item.quantity ?? 0),
+      unitPriceCents: Number(item.unit_price_cents ?? 0),
+      costPriceCents: Number(item.cost_price_cents ?? 0),
+      sellingPriceCents: Number(item.selling_price_cents ?? 0),
+      grossMarginCents: Number(item.gross_margin_cents ?? 0),
+      createdAt: item.created_at,
+    };
+
+    if (!accumulator[nextItem.saleId]) {
+      accumulator[nextItem.saleId] = [];
+    }
+
+    accumulator[nextItem.saleId].push(nextItem);
+    return accumulator;
+  }, {});
+
+  const transactions = sales.map<TransactionHistorySale>((sale) => ({
+    id: sale.id,
+    tenantId: sale.tenant_id,
+    cashierProfileId: sale.cashier_profile_id,
+    totalCents: sale.total_cents,
+    grossProfitCents: sale.gross_profit_cents,
+    expensesCents: sale.expenses_cents,
+    netProfitCents: sale.net_profit_cents,
+    status: sale.status,
+    createdAt: sale.created_at,
+    updatedAt: sale.updated_at,
+    syncedAt: sale.synced_at,
+    items: itemsBySaleId[sale.id] ?? [],
+  }));
 
   const dayStart = startOfDayIso();
   const weekStart = startOfWeekIso();
@@ -248,6 +422,8 @@ export const getAdminSnapshot = async (tenantId: string): Promise<AdminSnapshot>
     inventoryItems,
     categories,
     staffMembers,
+    transactions,
+    shiftReports,
   };
 };
 
@@ -370,6 +546,17 @@ export const saveInventoryItem = async (input: InventoryInput): Promise<void> =>
   await enqueueMutation(input.tenant_id, 'UPSERT', 'inventory_items', item);
 };
 
+export const deleteInventoryItem = async (tenantId: string, item: LocalInventoryItem): Promise<void> => {
+  const deletedItem: LocalInventoryItem = {
+    ...item,
+    updated_at: nowIso(),
+    deleted_at: nowIso(),
+  };
+
+  await upsertLocalInventoryItems([deletedItem]);
+  await enqueueMutation(tenantId, 'UPSERT', 'inventory_items', deletedItem);
+};
+
 export const deleteStaffMember = async (tenantId: string, staffMember: LocalStaffMember): Promise<void> => {
   const deletedStaff: LocalStaffMember = {
     ...staffMember,
@@ -384,4 +571,50 @@ export const deleteStaffMember = async (tenantId: string, staffMember: LocalStaf
 
 export const saveBranding = async (input: BrandingInput) => {
   return updateTenantPreferences(input.tenantId, input.colorPalette, input.logoImageUri ?? null);
+};
+
+const clearTenantRemoteData = async (tenantId: string): Promise<void> => {
+  if (!supabase) {
+    return;
+  }
+
+  const rpcResult = await supabase.rpc('clear_tenant_data', { target_tenant_id: tenantId });
+  if (!rpcResult.error) {
+    return;
+  }
+
+  const directDeletes = [
+    'shift_reports',
+    'sale_items',
+    'sales',
+    'product_inventory_links',
+    'products',
+    'inventory_items',
+    'categories',
+    'staff_members',
+  ] as const;
+
+  const rpcErrorMessage = rpcResult.error.message.toLowerCase();
+  const shouldFallback =
+    rpcErrorMessage.includes('schema cache') ||
+    rpcErrorMessage.includes('could not find the function') ||
+    rpcErrorMessage.includes('does not exist') ||
+    rpcErrorMessage.includes('undefined function');
+
+  if (!shouldFallback) {
+    throw new Error(rpcResult.error.message);
+  }
+
+  for (const tableName of directDeletes) {
+    const { error } = await supabase.from(tableName).delete().eq('tenant_id', tenantId);
+    if (error) {
+      throw new Error(error.message);
+    }
+  }
+};
+
+export const clearTenantData = async (tenantId: string): Promise<void> => {
+  await clearTenantRemoteData(tenantId);
+
+  await clearTenantLocalData(tenantId);
 };

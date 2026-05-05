@@ -85,6 +85,7 @@ export type LocalSaleInput = {
   cashier_profile_id: string | null;
   total_cents: number;
   expenses_cents?: number;
+  payment_method?: 'cash' | 'card' | 'qr';
   status?: string;
   created_at?: string;
   items: LocalSaleItemInput[];
@@ -98,9 +99,52 @@ export type LocalSale = {
   gross_profit_cents: number;
   expenses_cents: number;
   net_profit_cents: number;
+  payment_method: string;
   status: string;
   created_at: string;
   updated_at: string;
+  synced_at: string | null;
+};
+
+export type LocalShift = {
+  id: string;
+  tenant_id: string;
+  cashier_profile_id: string | null;
+  starting_cash_cents: number;
+  status: string;
+  opened_at: string;
+  closed_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type LocalShiftEvent = {
+  id: string;
+  shift_id: string;
+  tenant_id: string;
+  cashier_profile_id: string | null;
+  event_type: string;
+  amount_cents: number;
+  reason: string | null;
+  created_at: string;
+};
+
+export type LocalShiftReport = {
+  id: string;
+  shift_id: string;
+  tenant_id: string;
+  cashier_profile_id: string | null;
+  starting_cash_cents: number;
+  total_cash_sales_cents: number;
+  cash_refunds_cents: number;
+  pay_ins_cents: number;
+  payouts_cents: number;
+  expected_cash_cents: number;
+  actual_cash_cents: number;
+  variance_cents: number;
+  denomination_breakdown_json: string;
+  payments_summary_json: string;
+  created_at: string;
   synced_at: string | null;
 };
 
@@ -507,6 +551,7 @@ export const initializeOfflineDb = async (): Promise<void> => {
       gross_profit_cents INTEGER NOT NULL DEFAULT 0,
       expenses_cents INTEGER NOT NULL DEFAULT 0,
       net_profit_cents INTEGER NOT NULL DEFAULT 0,
+      payment_method TEXT NOT NULL DEFAULT 'cash',
       status TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
@@ -532,6 +577,57 @@ export const initializeOfflineDb = async (): Promise<void> => {
 
     CREATE INDEX IF NOT EXISTS idx_local_sale_items_sale
     ON local_sale_items (sale_id);
+
+    CREATE TABLE IF NOT EXISTS local_shifts (
+      id TEXT PRIMARY KEY NOT NULL,
+      tenant_id TEXT NOT NULL,
+      cashier_profile_id TEXT,
+      starting_cash_cents INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'open',
+      opened_at TEXT NOT NULL,
+      closed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_local_shifts_tenant_opened
+    ON local_shifts (tenant_id, opened_at DESC);
+
+    CREATE TABLE IF NOT EXISTS local_shift_events (
+      id TEXT PRIMARY KEY NOT NULL,
+      shift_id TEXT NOT NULL,
+      tenant_id TEXT NOT NULL,
+      cashier_profile_id TEXT,
+      event_type TEXT NOT NULL,
+      amount_cents INTEGER NOT NULL,
+      reason TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_local_shift_events_shift
+    ON local_shift_events (shift_id, created_at ASC);
+
+    CREATE TABLE IF NOT EXISTS local_shift_reports (
+      id TEXT PRIMARY KEY NOT NULL,
+      shift_id TEXT NOT NULL,
+      tenant_id TEXT NOT NULL,
+      cashier_profile_id TEXT,
+      starting_cash_cents INTEGER NOT NULL,
+      total_cash_sales_cents INTEGER NOT NULL,
+      cash_refunds_cents INTEGER NOT NULL,
+      pay_ins_cents INTEGER NOT NULL,
+      payouts_cents INTEGER NOT NULL,
+      expected_cash_cents INTEGER NOT NULL,
+      actual_cash_cents INTEGER NOT NULL,
+      variance_cents INTEGER NOT NULL,
+      denomination_breakdown_json TEXT NOT NULL,
+      payments_summary_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      synced_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_local_shift_reports_tenant_created
+    ON local_shift_reports (tenant_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS pending_mutations (
       id TEXT PRIMARY KEY NOT NULL,
@@ -637,6 +733,10 @@ export const initializeOfflineDb = async (): Promise<void> => {
 
   await db.execAsync(`
     ALTER TABLE local_sales ADD COLUMN net_profit_cents INTEGER NOT NULL DEFAULT 0;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_sales ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'cash';
   `).catch(() => undefined);
 
   await db.execAsync(`
@@ -777,6 +877,7 @@ export const listLocalSales = async (tenantId: string, limit = 50): Promise<Loca
         gross_profit_cents,
         expenses_cents,
         net_profit_cents,
+        payment_method,
         status,
         created_at,
         updated_at,
@@ -1007,6 +1108,7 @@ export const createLocalSale = async (input: LocalSaleInput): Promise<string> =>
   const updatedAt = nowIso();
   const status = input.status ?? 'completed';
   const normalizedExpenses = Math.max(0, input.expenses_cents ?? 0);
+  const paymentMethod = input.payment_method ?? 'cash';
   const mutationBaseMs = Date.parse(createdAt);
   const productMutationAt = new Date(mutationBaseMs + 1).toISOString();
   const inventoryMutationAt = new Date(mutationBaseMs + 2).toISOString();
@@ -1127,12 +1229,13 @@ export const createLocalSale = async (input: LocalSaleInput): Promise<string> =>
           gross_profit_cents,
           expenses_cents,
           net_profit_cents,
+          payment_method,
           status,
           created_at,
           updated_at,
           synced_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
       `,
       [
         saleId,
@@ -1142,6 +1245,7 @@ export const createLocalSale = async (input: LocalSaleInput): Promise<string> =>
         grossProfitCents,
         normalizedExpenses,
         netProfitCents,
+        paymentMethod,
         status,
         createdAt,
         updatedAt,
@@ -1303,6 +1407,7 @@ export const createLocalSale = async (input: LocalSaleInput): Promise<string> =>
         gross_profit_cents: grossProfitCents,
         expenses_cents: normalizedExpenses,
         net_profit_cents: netProfitCents,
+        payment_method: paymentMethod,
         status,
         created_at: createdAt,
       },
@@ -1400,6 +1505,295 @@ export const markSaleSynced = async (saleId: string): Promise<void> => {
   await initializeOfflineDb();
   const db = await getDb();
   await db.runAsync('UPDATE local_sales SET synced_at = ?, updated_at = ? WHERE id = ?', [nowIso(), nowIso(), saleId]);
+};
+
+export const markShiftReportSynced = async (reportId: string): Promise<void> => {
+  await initializeOfflineDb();
+  const db = await getDb();
+  await db.runAsync('UPDATE local_shift_reports SET synced_at = ? WHERE id = ?', [nowIso(), reportId]);
+};
+
+export const getActiveShift = async (tenantId: string): Promise<LocalShift | null> => {
+  await initializeOfflineDb();
+  const db = await getDb();
+  return db.getFirstAsync<LocalShift>(
+    `
+      SELECT
+        id,
+        tenant_id,
+        cashier_profile_id,
+        starting_cash_cents,
+        status,
+        opened_at,
+        closed_at,
+        created_at,
+        updated_at
+      FROM local_shifts
+      WHERE tenant_id = ?
+        AND status = 'open'
+      ORDER BY opened_at DESC
+      LIMIT 1
+    `,
+    [tenantId]
+  );
+};
+
+export const createShift = async (input: {
+  tenantId: string;
+  cashierProfileId: string | null;
+  startingCashCents: number;
+}): Promise<LocalShift> => {
+  await initializeOfflineDb();
+  const db = await getDb();
+
+  const shiftId = createLocalId();
+  const createdAt = nowIso();
+  const shift: LocalShift = {
+    id: shiftId,
+    tenant_id: input.tenantId,
+    cashier_profile_id: input.cashierProfileId,
+    starting_cash_cents: Math.max(0, input.startingCashCents),
+    status: 'open',
+    opened_at: createdAt,
+    closed_at: null,
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
+
+  await db.withTransactionAsync(async () => {
+    await db.runAsync(
+      `
+        INSERT INTO local_shifts (
+          id,
+          tenant_id,
+          cashier_profile_id,
+          starting_cash_cents,
+          status,
+          opened_at,
+          closed_at,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+      `,
+      [
+        shift.id,
+        shift.tenant_id,
+        shift.cashier_profile_id,
+        shift.starting_cash_cents,
+        shift.status,
+        shift.opened_at,
+        shift.created_at,
+        shift.updated_at,
+      ]
+    );
+
+    await db.runAsync(
+      `
+        INSERT INTO local_shift_events (
+          id,
+          shift_id,
+          tenant_id,
+          cashier_profile_id,
+          event_type,
+          amount_cents,
+          reason,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, 'opening', ?, ?, ?)
+      `,
+      [createLocalId(), shift.id, shift.tenant_id, shift.cashier_profile_id, shift.starting_cash_cents, 'Opening float', shift.created_at]
+    );
+  });
+
+  return shift;
+};
+
+export const addShiftEvent = async (input: {
+  shiftId: string;
+  tenantId: string;
+  cashierProfileId: string | null;
+  type: 'pay_in' | 'pay_out';
+  amountCents: number;
+  reason: string;
+}): Promise<string> => {
+  await initializeOfflineDb();
+  const db = await getDb();
+
+  const eventId = createLocalId();
+  const createdAt = nowIso();
+
+  await db.runAsync(
+    `
+      INSERT INTO local_shift_events (
+        id,
+        shift_id,
+        tenant_id,
+        cashier_profile_id,
+        event_type,
+        amount_cents,
+        reason,
+        created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+    [eventId, input.shiftId, input.tenantId, input.cashierProfileId, input.type, input.amountCents, input.reason, createdAt]
+  );
+
+  return eventId;
+};
+
+export const listShiftEvents = async (shiftId: string): Promise<LocalShiftEvent[]> => {
+  await initializeOfflineDb();
+  const db = await getDb();
+  return db.getAllAsync<LocalShiftEvent>(
+    `
+      SELECT id, shift_id, tenant_id, cashier_profile_id, event_type, amount_cents, reason, created_at
+      FROM local_shift_events
+      WHERE shift_id = ?
+      ORDER BY created_at ASC
+    `,
+    [shiftId]
+  );
+};
+
+export const createShiftReport = async (input: {
+  shiftId: string;
+  tenantId: string;
+  cashierProfileId: string | null;
+  startingCashCents: number;
+  totalCashSalesCents: number;
+  cashRefundsCents: number;
+  payInsCents: number;
+  payoutsCents: number;
+  expectedCashCents: number;
+  actualCashCents: number;
+  varianceCents: number;
+  denominationBreakdown: Record<string, number>;
+  paymentsSummary: Record<string, number>;
+}): Promise<string> => {
+  await initializeOfflineDb();
+  const db = await getDb();
+
+  const reportId = createLocalId();
+  const createdAt = nowIso();
+  const denominationJson = JSON.stringify(input.denominationBreakdown);
+  const paymentsJson = JSON.stringify(input.paymentsSummary);
+
+  await db.withTransactionAsync(async () => {
+    await db.runAsync(
+      `
+        INSERT INTO local_shift_reports (
+          id,
+          shift_id,
+          tenant_id,
+          cashier_profile_id,
+          starting_cash_cents,
+          total_cash_sales_cents,
+          cash_refunds_cents,
+          pay_ins_cents,
+          payouts_cents,
+          expected_cash_cents,
+          actual_cash_cents,
+          variance_cents,
+          denomination_breakdown_json,
+          payments_summary_json,
+          created_at,
+          synced_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      `,
+      [
+        reportId,
+        input.shiftId,
+        input.tenantId,
+        input.cashierProfileId,
+        input.startingCashCents,
+        input.totalCashSalesCents,
+        input.cashRefundsCents,
+        input.payInsCents,
+        input.payoutsCents,
+        input.expectedCashCents,
+        input.actualCashCents,
+        input.varianceCents,
+        denominationJson,
+        paymentsJson,
+        createdAt,
+      ]
+    );
+
+    await db.runAsync(
+      `
+        UPDATE local_shifts
+        SET status = 'closed',
+            closed_at = ?,
+            updated_at = ?
+        WHERE id = ?
+      `,
+      [createdAt, createdAt, input.shiftId]
+    );
+
+    await db.runAsync(
+      `
+        INSERT INTO pending_mutations (
+          id,
+          tenant_id,
+          operation,
+          table_name,
+          payload,
+          created_at,
+          attempts,
+          last_error,
+          next_attempt_at
+        )
+        VALUES (?, ?, 'UPSERT', 'shift_reports', ?, ?, 0, NULL, ?)
+      `,
+      [
+        createLocalId(),
+        input.tenantId,
+        JSON.stringify({
+          id: reportId,
+          shift_id: input.shiftId,
+          tenant_id: input.tenantId,
+          cashier_profile_id: input.cashierProfileId,
+          starting_cash_cents: input.startingCashCents,
+          total_cash_sales_cents: input.totalCashSalesCents,
+          cash_refunds_cents: input.cashRefundsCents,
+          pay_ins_cents: input.payInsCents,
+          payouts_cents: input.payoutsCents,
+          expected_cash_cents: input.expectedCashCents,
+          actual_cash_cents: input.actualCashCents,
+          variance_cents: input.varianceCents,
+          denomination_breakdown: input.denominationBreakdown,
+          payments_summary: input.paymentsSummary,
+          created_at: createdAt,
+        }),
+        createdAt,
+        createdAt,
+      ]
+    );
+  });
+
+  return reportId;
+};
+
+export const clearTenantLocalData = async (tenantId: string): Promise<void> => {
+  await initializeOfflineDb();
+  const db = await getDb();
+
+  await db.withTransactionAsync(async () => {
+    await db.runAsync('DELETE FROM local_shift_events WHERE tenant_id = ?', [tenantId]);
+    await db.runAsync('DELETE FROM local_shift_reports WHERE tenant_id = ?', [tenantId]);
+    await db.runAsync('DELETE FROM local_shifts WHERE tenant_id = ?', [tenantId]);
+    await db.runAsync('DELETE FROM local_sale_items WHERE tenant_id = ?', [tenantId]);
+    await db.runAsync('DELETE FROM local_sales WHERE tenant_id = ?', [tenantId]);
+    await db.runAsync('DELETE FROM local_products WHERE tenant_id = ?', [tenantId]);
+    await db.runAsync('DELETE FROM local_inventory_items WHERE tenant_id = ?', [tenantId]);
+    await db.runAsync('DELETE FROM local_categories WHERE tenant_id = ?', [tenantId]);
+    await db.runAsync('DELETE FROM local_staff_members WHERE tenant_id = ?', [tenantId]);
+    await db.runAsync('DELETE FROM pending_mutations WHERE tenant_id = ?', [tenantId]);
+    await db.runAsync('DELETE FROM sync_cursors WHERE tenant_id = ?', [tenantId]);
+  });
 };
 
 export const getSyncCursor = async (

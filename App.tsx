@@ -9,7 +9,7 @@ import { RotateDeviceScreen } from './src/screens/common/RotateDeviceScreen';
 import { PosLandscapeScreen } from './src/screens/pos/PosLandscapeScreen';
 import { initializeOfflineDb } from './src/services/offlineDb';
 import { startSyncEngine, stopSyncEngine } from './src/services/syncService';
-import { hasSupabaseEnv } from './src/lib/env';
+import { hasSupabaseEnv, supabaseUrl } from './src/lib/env';
 import { useAuthStore } from './src/store/authStore';
 import { useThemeStore } from './src/store/themeStore';
 
@@ -68,6 +68,18 @@ const AppShell = () => {
       }
 
       if (hasSupabaseEnv) {
+        try {
+          // quick runtime network check to diagnose `Network request failed`
+          // logs will show in Metro/Expo device logs
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          const resp = await fetch(supabaseUrl as string).catch((e) => {
+            throw e;
+          });
+          console.log('Supabase ping OK', resp?.status ?? 'no-status');
+        } catch (err) {
+          console.error('Supabase ping failed', err);
+        }
+
         await initialize();
       }
     };

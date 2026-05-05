@@ -7,6 +7,7 @@ import {
   markMutationFailed,
   markMutationSynced,
   markSaleSynced,
+  markShiftReportSynced,
   type LocalInventoryItem,
   type LocalCategory,
   type LocalProduct,
@@ -15,9 +16,10 @@ import {
   updateSyncCursor,
   upsertLocalInventoryItems,
   upsertLocalProducts,
+  withOfflineDb,
 } from './offlineDb';
 
-type SyncableTable = 'products' | 'inventory_items' | 'sales' | 'categories' | 'staff_members';
+type SyncableTable = 'products' | 'inventory_items' | 'sales' | 'categories' | 'staff_members' | 'shift_reports';
 
 type SaleMutationPayload = {
   sale: {
@@ -28,6 +30,7 @@ type SaleMutationPayload = {
     gross_profit_cents: number;
     expenses_cents: number;
     net_profit_cents: number;
+    payment_method: string;
     status: string;
     created_at: string;
   };
@@ -45,6 +48,24 @@ type SaleMutationPayload = {
   }>;
 };
 
+type ShiftReportPayload = {
+  id: string;
+  shift_id: string;
+  tenant_id: string;
+  cashier_profile_id: string | null;
+  starting_cash_cents: number;
+  total_cash_sales_cents: number;
+  cash_refunds_cents: number;
+  pay_ins_cents: number;
+  payouts_cents: number;
+  expected_cash_cents: number;
+  actual_cash_cents: number;
+  variance_cents: number;
+  denomination_breakdown: Record<string, number>;
+  payments_summary: Record<string, number>;
+  created_at: string;
+};
+
 type ProductRow = {
   id: string;
   tenant_id: string;
@@ -60,6 +81,7 @@ type ProductRow = {
   deduction_multiplier: number | null;
   active: boolean;
   updated_at?: string;
+  deleted_at?: string | null;
   created_at: string;
 };
 
@@ -103,6 +125,7 @@ type InventoryRow = {
   quantity: number;
   unit: string | null;
   updated_at: string;
+  deleted_at?: string | null;
 };
 
 let syncTimer: ReturnType<typeof setInterval> | null = null;
@@ -182,29 +205,7 @@ const mergeCursor = (left: string | null, right: string | null): string | null =
   return left > right ? left : right;
 };
 
-const toLocalProduct = (row: ProductRow, linkedInventoryIds?: string[]): LocalProduct => ({
-  id: row.id,
-  tenant_id: row.tenant_id,
-  category_id: row.category_id,
-  name: row.name,
-  image_path: row.image_path,
-  price_cents: row.price_cents,
-  selling_price_cents: row.selling_price_cents ?? row.price_cents,
-  cost_price_cents: row.cost_price_cents ?? 0,
-  inventory_tracking: row.inventory_tracking ?? true,
-  stock_count: row.stock_count ?? 0,
-  linked_inventory_item_id: linkedInventoryIds && linkedInventoryIds.length > 0 ? linkedInventoryIds[0] : row.linked_inventory_item_id ?? null,
-  linked_inventory_item_ids_json:
-    linkedInventoryIds && linkedInventoryIds.length > 0
-      ? JSON.stringify(Array.from(new Set(linkedInventoryIds)))
-      : row.linked_inventory_item_id
-        ? JSON.stringify([row.linked_inventory_item_id])
-        : null,
-  deduction_multiplier: row.deduction_multiplier ?? 1,
-  active: row.active,
-  updated_at: row.updated_at ?? row.created_at,
-  deleted_at: null,
-});
+
 
 const toLocalCategory = (row: CategoryRow): LocalCategory => ({
   id: row.id,
@@ -238,8 +239,75 @@ const toLocalInventory = (row: InventoryRow): LocalInventoryItem => ({
   quantity: row.quantity,
   unit: row.unit,
   updated_at: row.updated_at,
-  deleted_at: null,
+  deleted_at: row.deleted_at ?? null,
 });
+
+const toLocalProduct = (row: ProductRow, linkedIds?: string[]): LocalProduct => ({
+  id: row.id,
+  tenant_id: row.tenant_id,
+  category_id: row.category_id,
+  name: row.name,
+  image_path: row.image_path ?? null,
+  price_cents: row.price_cents,
+  selling_price_cents: row.selling_price_cents ?? row.price_cents,
+  cost_price_cents: row.cost_price_cents ?? 0,
+  inventory_tracking: row.inventory_tracking ?? true,
+  stock_count: row.stock_count ?? 0,
+  linked_inventory_item_id: linkedIds && linkedIds.length > 0 ? linkedIds[0] : row.linked_inventory_item_id ?? null,
+  linked_inventory_item_ids_json:
+    linkedIds && linkedIds.length > 0
+      ? JSON.stringify(Array.from(new Set(linkedIds)))
+      : row.linked_inventory_item_id
+      ? JSON.stringify([row.linked_inventory_item_id])
+      : null,
+  deduction_multiplier: row.deduction_multiplier ?? 1,
+  active: row.active,
+  updated_at: row.updated_at ?? row.created_at,
+  deleted_at: row.deleted_at ?? null,
+});
+
+const loadLocalDeletionMap = async (
+  tableName: 'local_products' | 'local_inventory_items',
+  ids: string[]
+): Promise<Map<string, string>> => {
+  if (ids.length === 0) {
+    return new Map();
+  }
+
+  return withOfflineDb(async (db) => {
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = await db.getAllAsync<{ id: string; deleted_at: string | null }>(
+      `
+        SELECT id, deleted_at
+        FROM ${tableName}
+        WHERE id IN (${placeholders})
+          AND deleted_at IS NOT NULL
+      `,
+      ids
+    );
+
+    return new Map(rows.map((row) => [row.id, row.deleted_at ?? '']));
+  });
+};
+
+const shouldApplyRemoteUpdate = (deletedAt: string | undefined, remoteTimestamp?: string): boolean => {
+  if (!deletedAt) {
+    return true;
+  }
+
+  const deletedMs = Date.parse(deletedAt);
+  const remoteMs = remoteTimestamp ? Date.parse(remoteTimestamp) : Number.NaN;
+
+  if (!Number.isFinite(deletedMs)) {
+    return true;
+  }
+
+  if (!Number.isFinite(remoteMs)) {
+    return false;
+  }
+
+  return remoteMs > deletedMs;
+};
 
 const pushMutation = async (tableName: string, payload: unknown): Promise<void> => {
   if (!supabase) {
@@ -286,6 +354,8 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
         linked_inventory_item_id: linkedInventoryItemId,
         deduction_multiplier: product.deduction_multiplier,
         active: product.active,
+        deleted_at: product.deleted_at ?? null,
+        updated_at: product.updated_at ?? undefined,
       },
       { onConflict: 'id' }
     );
@@ -361,6 +431,8 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
         name: item.name,
         quantity: item.quantity,
         unit: item.unit,
+        deleted_at: item.deleted_at ?? null,
+        updated_at: item.updated_at ?? undefined,
       },
       { onConflict: 'id' }
     );
@@ -387,6 +459,7 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
         gross_profit_cents: salePayload.sale.gross_profit_cents,
         expenses_cents: salePayload.sale.expenses_cents,
         net_profit_cents: salePayload.sale.net_profit_cents,
+        payment_method: salePayload.sale.payment_method ?? 'cash',
         status: salePayload.sale.status,
         created_at: salePayload.sale.created_at,
       },
@@ -446,6 +519,40 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
     }
 
     await markSaleSynced(saleId);
+    return;
+  }
+
+  if (tableName === 'shift_reports') {
+    const report = payload as ShiftReportPayload;
+    const reportId = assertRequiredUuid(report.id, 'shift_reports.id');
+    const tenantId = assertRequiredUuid(report.tenant_id, 'shift_reports.tenant_id');
+    const cashierProfileId = toValidUuidOrNull(report.cashier_profile_id);
+
+    const { error } = await supabase.from('shift_reports').upsert(
+      {
+        id: reportId,
+        tenant_id: tenantId,
+        cashier_profile_id: cashierProfileId,
+        starting_cash_cents: report.starting_cash_cents,
+        total_cash_sales_cents: report.total_cash_sales_cents,
+        cash_refunds_cents: report.cash_refunds_cents,
+        pay_ins_cents: report.pay_ins_cents,
+        payouts_cents: report.payouts_cents,
+        expected_cash_cents: report.expected_cash_cents,
+        actual_cash_cents: report.actual_cash_cents,
+        variance_cents: report.variance_cents,
+        denomination_breakdown: report.denomination_breakdown,
+        payments_summary: report.payments_summary,
+        created_at: report.created_at,
+      },
+      { onConflict: 'id' }
+    );
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    await markShiftReportSynced(reportId);
     return;
   }
 
@@ -543,7 +650,7 @@ const pullProducts = async (
 
   const { data, error } = await supabase
     .from('products')
-    .select('id, tenant_id, category_id, name, image_path, price_cents, selling_price_cents, cost_price_cents, inventory_tracking, stock_count, linked_inventory_item_id, deduction_multiplier, active, updated_at, created_at')
+    .select('id, tenant_id, category_id, name, image_path, price_cents, selling_price_cents, cost_price_cents, inventory_tracking, stock_count, linked_inventory_item_id, deduction_multiplier, active, updated_at, deleted_at, created_at')
     .eq('tenant_id', tenantId)
     .gte('updated_at', productsCursor)
     .order('updated_at', { ascending: true })
@@ -572,7 +679,14 @@ const pullProducts = async (
   const linkRows = (linkData as ProductInventoryLinkRow[]) ?? [];
   const linkedIdsMap = buildLinkedIdsMap(linkRows);
 
-  await upsertLocalProducts(rows.map((row) => toLocalProduct(row, linkedIdsMap.get(row.id))));
+  const deletionMap = await loadLocalDeletionMap('local_products', productIds);
+  const filteredRows = rows.filter((row) =>
+    shouldApplyRemoteUpdate(deletionMap.get(row.id), row.updated_at ?? row.created_at)
+  );
+
+  if (filteredRows.length > 0) {
+    await upsertLocalProducts(filteredRows.map((row) => toLocalProduct(row, linkedIdsMap.get(row.id))));
+  }
   return {
     cursor: rows[rows.length - 1]?.updated_at ?? rows[rows.length - 1]?.created_at ?? null,
     productIds,
@@ -618,7 +732,7 @@ const refreshProductsFromCloud = async (tenantId: string, productIds: string[]):
 
   const { data: productData, error: productError } = await supabase
     .from('products')
-    .select('id, tenant_id, category_id, name, image_path, price_cents, selling_price_cents, cost_price_cents, inventory_tracking, stock_count, linked_inventory_item_id, deduction_multiplier, active, updated_at, created_at')
+    .select('id, tenant_id, category_id, name, image_path, price_cents, selling_price_cents, cost_price_cents, inventory_tracking, stock_count, linked_inventory_item_id, deduction_multiplier, active, updated_at, deleted_at, created_at')
     .eq('tenant_id', tenantId)
     .in('id', productIds)
     .limit(4000);
@@ -645,7 +759,17 @@ const refreshProductsFromCloud = async (tenantId: string, productIds: string[]):
   const linkRows = (linkData as ProductInventoryLinkRow[]) ?? [];
   const linkedIdsMap = buildLinkedIdsMap(linkRows);
 
-  await upsertLocalProducts(rows.map((row) => toLocalProduct(row, linkedIdsMap.get(row.id))));
+  const deletionMap = await loadLocalDeletionMap(
+    'local_products',
+    rows.map((row) => row.id)
+  );
+  const filteredRows = rows.filter((row) =>
+    shouldApplyRemoteUpdate(deletionMap.get(row.id), row.updated_at ?? row.created_at)
+  );
+
+  if (filteredRows.length > 0) {
+    await upsertLocalProducts(filteredRows.map((row) => toLocalProduct(row, linkedIdsMap.get(row.id))));
+  }
 };
 
 const pullCategories = async (tenantId: string, categoriesCursor: string): Promise<string | null> => {
@@ -707,7 +831,7 @@ const pullInventory = async (tenantId: string, inventoryCursor: string): Promise
 
   const { data, error } = await supabase
     .from('inventory_items')
-    .select('id, tenant_id, sku, name, quantity, unit, updated_at')
+    .select('id, tenant_id, sku, name, quantity, unit, updated_at, deleted_at')
     .eq('tenant_id', tenantId)
     .gte('updated_at', inventoryCursor)
     .order('updated_at', { ascending: true })
@@ -722,7 +846,15 @@ const pullInventory = async (tenantId: string, inventoryCursor: string): Promise
     return null;
   }
 
-  await upsertLocalInventoryItems(rows.map(toLocalInventory));
+  const deletionMap = await loadLocalDeletionMap(
+    'local_inventory_items',
+    rows.map((row) => row.id)
+  );
+  const filteredRows = rows.filter((row) => shouldApplyRemoteUpdate(deletionMap.get(row.id), row.updated_at));
+
+  if (filteredRows.length > 0) {
+    await upsertLocalInventoryItems(filteredRows.map(toLocalInventory));
+  }
   return rows[rows.length - 1]?.updated_at ?? null;
 };
 

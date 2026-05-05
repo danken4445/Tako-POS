@@ -53,6 +53,7 @@ export const getPosSnapshot = async (tenantId: string): Promise<PosSnapshot> => 
             gross_profit_cents,
             expenses_cents,
             net_profit_cents,
+            payment_method,
             status,
             created_at,
             updated_at,

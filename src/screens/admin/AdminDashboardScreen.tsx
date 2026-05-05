@@ -6,7 +6,9 @@ import ColorPicker from 'react-native-wheel-color-picker';
 import { BrandHeader } from '../../components/common/BrandHeader';
 import { GlassPanel } from '../../components/glass/GlassPanel';
 import {
+  clearTenantData,
   deleteCategory,
+  deleteInventoryItem,
   deleteProduct,
   deleteStaffMember,
   getAdminSnapshot,
@@ -26,7 +28,7 @@ import { useAuthStore } from '../../store/authStore';
 import { useThemeStore } from '../../store/themeStore';
 import type { TenantPalette } from '../../types/auth';
 
-type AdminTab = 'overview' | 'products' | 'inventory' | 'categories' | 'staff' | 'settings';
+type AdminTab = 'overview' | 'transactions' | 'shiftReports' | 'products' | 'inventory' | 'categories' | 'staff' | 'settings';
 
 const defaultProductForm: ProductInput = {
   tenant_id: '',
@@ -78,6 +80,13 @@ const phpFormatter = new Intl.NumberFormat('en-PH', {
   minimumFractionDigits: 2,
   maximumFractionDigits: 2,
 });
+
+const dateTimeFormatter = new Intl.DateTimeFormat('en-PH', {
+  dateStyle: 'medium',
+  timeStyle: 'short',
+});
+
+const VARIANCE_ALERT_CENTS = 500;
 
 const formatCurrency = (cents: number): string => phpFormatter.format(cents / 100);
 
@@ -268,21 +277,32 @@ export const AdminDashboardScreen = () => {
   const [productForm, setProductForm] = useState<ProductInput>(defaultProductForm);
   const [productImageUri, setProductImageUri] = useState<string | null>(null);
   const [productImagePreviewUrlById, setProductImagePreviewUrlById] = useState<Record<string, string | null>>({});
+  const [selectedProductIds, setSelectedProductIds] = useState<Record<string, true>>({});
+  const [productBulkMode, setProductBulkMode] = useState(false);
   const [inventoryForm, setInventoryForm] = useState<InventoryInput>(defaultInventoryForm);
+  const [selectedInventoryIds, setSelectedInventoryIds] = useState<Record<string, true>>({});
+  const [inventoryBulkMode, setInventoryBulkMode] = useState(false);
   const [categoryForm, setCategoryForm] = useState<CategoryInput>(defaultCategoryForm);
   const [staffForm, setStaffForm] = useState<StaffInput>(defaultStaffForm);
   const [brandLogoUri, setBrandLogoUri] = useState<string | null>(null);
   const [settingsPalette, setSettingsPalette] = useState<TenantPalette>(palette);
+  const [expandedTransactionIds, setExpandedTransactionIds] = useState<Record<string, true>>({});
+  const [refreshingSnapshot, setRefreshingSnapshot] = useState(false);
 
   const tenantId = profile?.tenant_id ?? '';
   const isLandscape = width > height;
 
-  const loadSnapshot = useCallback(async () => {
+  const loadSnapshot = useCallback(async (options?: { silent?: boolean }) => {
     if (!tenantId) {
       return;
     }
 
-    setLoading(true);
+    if (options?.silent) {
+      setRefreshingSnapshot(true);
+    } else {
+      setLoading(true);
+    }
+
     try {
       const nextSnapshot = await getAdminSnapshot(tenantId);
       setSnapshot(nextSnapshot);
@@ -293,13 +313,29 @@ export const AdminDashboardScreen = () => {
 
       setProductImagePreviewUrlById(Object.fromEntries(imagePreviewEntries));
     } finally {
-      setLoading(false);
+      if (options?.silent) {
+        setRefreshingSnapshot(false);
+      } else {
+        setLoading(false);
+      }
     }
   }, [tenantId]);
 
   useEffect(() => {
     void loadSnapshot();
   }, [loadSnapshot]);
+
+  useEffect(() => {
+    if (!tenantId) {
+      return;
+    }
+
+    const intervalId = setInterval(() => {
+      void loadSnapshot({ silent: true });
+    }, 5000);
+
+    return () => clearInterval(intervalId);
+  }, [loadSnapshot, tenantId]);
 
   useEffect(() => {
     setSettingsPalette(palette);
@@ -333,6 +369,69 @@ export const AdminDashboardScreen = () => {
     return normalized.includes('failed') || normalized.includes('error') || normalized.includes('unable');
   }, [statusMessage]);
 
+  const isOwner = profile?.role === 'StoreOwner' || profile?.role === 'SuperAdmin';
+
+  const toggleTransactionExpanded = (transactionId: string) => {
+    setExpandedTransactionIds((current) => {
+      const next = { ...current };
+      if (next[transactionId]) {
+        delete next[transactionId];
+      } else {
+        next[transactionId] = true;
+      }
+      return next;
+    });
+  };
+
+  const clearAllData = async () => {
+    if (!tenantId) {
+      return;
+    }
+
+    Alert.alert(
+      'Clear all data?',
+      'This will permanently delete sales, line items, products, inventory, categories, staff, and sync history for this tenant. Branding stays intact.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Continue',
+          style: 'destructive',
+          onPress: () => {
+            Alert.alert('Final warning', 'This cannot be undone. Delete everything now?', [
+              { text: 'Cancel', style: 'cancel' },
+              {
+                text: 'Delete all data',
+                style: 'destructive',
+                onPress: async () => {
+                  try {
+                    await clearTenantData(tenantId);
+                    setExpandedTransactionIds({});
+                    setSelectedProductIds({});
+                    setProductBulkMode(false);
+                    setSelectedInventoryIds({});
+                    setInventoryBulkMode(false);
+                    setProductForm({ ...defaultProductForm, tenant_id: tenantId });
+                    setInventoryForm({ ...defaultInventoryForm, tenant_id: tenantId });
+                    setCategoryForm({ ...defaultCategoryForm, tenant_id: tenantId });
+                    setStaffForm({ ...defaultStaffForm, tenant_id: tenantId });
+                    setProductImageUri(null);
+                    setBrandLogoUri(null);
+                    setStatusMessage('Tenant data cleared. Refreshing dashboard...');
+                    await loadSnapshot();
+                  } catch (error) {
+                    const message = error instanceof Error ? error.message : 'Unable to clear tenant data.';
+                    setStatusMessage(message);
+                    Alert.alert('Clear data failed', message);
+                  }
+                },
+              },
+            ]);
+          },
+        },
+      ]
+    );
+  };
+
   const selectProduct = (productId: string) => {
     const product = snapshot?.products.find((entry) => entry.id === productId);
     if (!product) {
@@ -357,6 +456,46 @@ export const AdminDashboardScreen = () => {
     });
 
     setProductImageUri(null);
+  };
+
+  const toggleSelectProductId = (productId: string) => {
+    setSelectedProductIds((current) => {
+      const next = { ...current };
+      if (next[productId]) {
+        delete next[productId];
+      } else {
+        next[productId] = true;
+      }
+      return next;
+    });
+  };
+
+  const confirmDeleteSelectedProducts = async () => {
+    if (!tenantId || !snapshot) return;
+    const ids = Object.keys(selectedProductIds);
+    if (ids.length === 0) return;
+
+    Alert.alert('Delete selected products', `Archive ${ids.length} selected product(s)?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Archive',
+        style: 'destructive',
+        onPress: async () => {
+          for (const id of ids) {
+            const product = snapshot.products.find((p) => p.id === id);
+            if (product) {
+              // eslint-disable-next-line no-await-in-loop
+              await deleteProduct(tenantId, product);
+            }
+          }
+
+          setSelectedProductIds({});
+          setProductBulkMode(false);
+          setStatusMessage('Selected products archived.');
+          await loadSnapshot();
+        },
+      },
+    ]);
   };
 
   const clearProductEdit = () => {
@@ -486,10 +625,19 @@ export const AdminDashboardScreen = () => {
       return;
     }
 
-    await deleteProduct(tenantId, product);
-    clearProductEdit();
-    setStatusMessage('Product archived.');
-    await loadSnapshot();
+    Alert.alert('Delete product', 'Are you sure you want to archive this product?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Archive',
+        style: 'destructive',
+        onPress: async () => {
+          await deleteProduct(tenantId, product);
+          clearProductEdit();
+          setStatusMessage('Product archived.');
+          await loadSnapshot();
+        },
+      },
+    ]);
   };
 
   const handleSaveInventory = async () => {
@@ -523,6 +671,71 @@ export const AdminDashboardScreen = () => {
     }
   };
 
+  const toggleSelectInventoryId = (inventoryId: string) => {
+    setSelectedInventoryIds((current) => {
+      const next = { ...current };
+      if (next[inventoryId]) {
+        delete next[inventoryId];
+      } else {
+        next[inventoryId] = true;
+      }
+      return next;
+    });
+  };
+
+  const confirmDeleteSelectedInventory = async () => {
+    if (!tenantId || !snapshot) return;
+    const ids = Object.keys(selectedInventoryIds);
+    if (ids.length === 0) return;
+
+    Alert.alert('Delete selected ingredients', `Archive ${ids.length} selected ingredient(s)?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Archive',
+        style: 'destructive',
+        onPress: async () => {
+          for (const id of ids) {
+            const item = snapshot.inventoryItems.find((i) => i.id === id);
+            if (item) {
+              // eslint-disable-next-line no-await-in-loop
+              await deleteInventoryItem(tenantId, item);
+            }
+          }
+
+          setSelectedInventoryIds({});
+          setInventoryBulkMode(false);
+          setStatusMessage('Selected ingredients archived.');
+          await loadSnapshot();
+        },
+      },
+    ]);
+  };
+
+  const handleDeleteInventory = async () => {
+    if (!tenantId || !inventoryForm.id || !snapshot) {
+      return;
+    }
+
+    const item = snapshot.inventoryItems.find((entry) => entry.id === inventoryForm.id);
+    if (!item) {
+      return;
+    }
+
+    Alert.alert('Delete ingredient', `Archive ingredient "${item.name}"?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Archive',
+        style: 'destructive',
+        onPress: async () => {
+          await deleteInventoryItem(tenantId, item);
+          setInventoryForm({ ...defaultInventoryForm, tenant_id: tenantId });
+          setStatusMessage('Ingredient archived.');
+          await loadSnapshot();
+        },
+      },
+    ]);
+  };
+
   const handleQuickAddIngredient = async (name: string) => {
     if (!tenantId) {
       return;
@@ -550,6 +763,13 @@ export const AdminDashboardScreen = () => {
       return;
     }
 
+    if (!categoryForm.name || !categoryForm.name.trim()) {
+      const message = 'Category name is required.';
+      setStatusMessage(message);
+      Alert.alert('Validation error', message);
+      return;
+    }
+
     await saveCategory({
       ...categoryForm,
       tenant_id: tenantId,
@@ -572,14 +792,30 @@ export const AdminDashboardScreen = () => {
       return;
     }
 
-    await deleteCategory(tenantId, category);
-    setCategoryForm({ ...defaultCategoryForm, tenant_id: tenantId });
-    setStatusMessage('Category archived.');
-    await loadSnapshot();
+    Alert.alert('Delete category', `Archive category "${category.name}"?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Archive',
+        style: 'destructive',
+        onPress: async () => {
+          await deleteCategory(tenantId, category);
+          setCategoryForm({ ...defaultCategoryForm, tenant_id: tenantId });
+          setStatusMessage('Category archived.');
+          await loadSnapshot();
+        },
+      },
+    ]);
   };
 
   const handleSaveStaff = async () => {
     if (!tenantId) {
+      return;
+    }
+
+    if (!staffForm.name || !staffForm.name.trim()) {
+      const message = 'Staff name is required.';
+      setStatusMessage(message);
+      Alert.alert('Validation error', message);
       return;
     }
 
@@ -608,10 +844,19 @@ export const AdminDashboardScreen = () => {
       return;
     }
 
-    await deleteStaffMember(tenantId, staff);
-    setStaffForm({ ...defaultStaffForm, tenant_id: tenantId });
-    setStatusMessage('Staff member archived.');
-    await loadSnapshot();
+    Alert.alert('Delete staff', `Archive staff member "${staff.name}"?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Archive',
+        style: 'destructive',
+        onPress: async () => {
+          await deleteStaffMember(tenantId, staff);
+          setStaffForm({ ...defaultStaffForm, tenant_id: tenantId });
+          setStatusMessage('Staff member archived.');
+          await loadSnapshot();
+        },
+      },
+    ]);
   };
 
   const handlePickLogo = async () => {
@@ -699,7 +944,158 @@ export const AdminDashboardScreen = () => {
       <GlassPanel>
         <Text style={[styles.sectionTitle, { color: palette.text }]}>Live Status</Text>
         <Text style={[styles.cardBody, { color: palette.mutedText }]}>Transactions and inventory are stored locally first, then synced in the background.</Text>
+        {refreshingSnapshot ? <Text style={[styles.loadingHint, { color: palette.mutedText }]}>Live sync check running...</Text> : null}
         <Text style={[styles.cardBody, { color: palette.mutedText }]}>{statusMessage}</Text>
+      </GlassPanel>
+    </View>
+  );
+
+  const renderTransactions = () => (
+    <View style={styles.contentStack}>
+      <GlassPanel>
+        <Text style={[styles.sectionTitle, { color: palette.text }]}>Transaction History</Text>
+        <Text style={[styles.sectionHint, { color: palette.mutedText }]}>Live POS sales with expandable line items and profit details.</Text>
+        {snapshot?.transactions.length ? (
+          <View style={styles.transactionList}>
+            {snapshot.transactions.map((transaction) => {
+              const expanded = Boolean(expandedTransactionIds[transaction.id]);
+
+              return (
+                <View key={transaction.id} style={[styles.transactionCard, { borderColor: `${palette.text}22`, backgroundColor: `${palette.surface}C8` }]}>
+                  <Pressable style={styles.transactionHeader} onPress={() => toggleTransactionExpanded(transaction.id)}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[styles.rowTitle, { color: palette.text }]} numberOfLines={1}>
+                        {transaction.id.slice(0, 8).toUpperCase()}
+                      </Text>
+                      <Text style={[styles.rowMeta, { color: palette.mutedText }]}>
+                        {dateTimeFormatter.format(new Date(transaction.createdAt))} · {transaction.items.length} item{transaction.items.length === 1 ? '' : 's'}
+                      </Text>
+                    </View>
+                    <View style={styles.transactionHeaderRight}>
+                      <Text style={[styles.transactionTotal, { color: palette.primary }]}>{formatCurrency(transaction.totalCents)}</Text>
+                      <Text style={[styles.transactionStatus, { color: transaction.status === 'completed' ? palette.success : palette.mutedText }]}>{transaction.status}</Text>
+                    </View>
+                  </Pressable>
+
+                  <View style={styles.transactionFooterRow}>
+                    <Text style={[styles.transactionFooterText, { color: palette.mutedText }]}>Net {formatCurrency(transaction.netProfitCents)}</Text>
+                    <Pressable onPress={() => toggleTransactionExpanded(transaction.id)} style={[styles.transactionToggle, { borderColor: `${palette.text}33` }]}>
+                      <Text style={[styles.transactionToggleText, { color: palette.text }]}>{expanded ? 'Collapse' : 'Expand'}</Text>
+                    </Pressable>
+                  </View>
+
+                  {expanded ? (
+                    <View style={styles.transactionDetails}>
+                      <View style={styles.transactionDetailGrid}>
+                        <View style={styles.transactionMetric}>
+                          <Text style={[styles.transactionMetricLabel, { color: palette.mutedText }]}>Gross profit</Text>
+                          <Text style={[styles.transactionMetricValue, { color: palette.text }]}>{formatCurrency(transaction.grossProfitCents)}</Text>
+                        </View>
+                        <View style={styles.transactionMetric}>
+                          <Text style={[styles.transactionMetricLabel, { color: palette.mutedText }]}>Expenses</Text>
+                          <Text style={[styles.transactionMetricValue, { color: palette.text }]}>{formatCurrency(transaction.expensesCents)}</Text>
+                        </View>
+                      </View>
+
+                      <Text style={[styles.transactionSectionLabel, { color: palette.mutedText }]}>Items</Text>
+                      {transaction.items.map((item) => (
+                        <View key={item.id} style={styles.transactionItemRow}>
+                          <View style={{ flex: 1 }}>
+                            <Text style={[styles.rowTitle, { color: palette.text }]}>{item.productName}</Text>
+                            <Text style={[styles.rowMeta, { color: palette.mutedText }]}>
+                              Qty {item.quantity} · {formatCurrency(item.unitPriceCents)} each
+                            </Text>
+                          </View>
+                          <Text style={[styles.rowValue, { color: palette.primary }]}>{formatCurrency(item.unitPriceCents * item.quantity)}</Text>
+                        </View>
+                      ))}
+                    </View>
+                  ) : null}
+                </View>
+              );
+            })}
+          </View>
+        ) : (
+          <Text style={[styles.cardBody, { color: palette.mutedText }]}>No transactions yet.</Text>
+        )}
+      </GlassPanel>
+    </View>
+  );
+
+  const renderShiftReports = () => (
+    <View style={styles.contentStack}>
+      <GlassPanel>
+        <Text style={[styles.sectionTitle, { color: palette.text }]}>Shift Reports</Text>
+        <Text style={[styles.sectionHint, { color: palette.mutedText }]}>Z-readings synced from the POS terminal.</Text>
+        {snapshot?.shiftReports.length ? (
+          <View style={styles.transactionList}>
+            {snapshot.shiftReports.map((report) => {
+              const variance = report.varianceCents;
+              const varianceLabel = variance === 0 ? 'Balanced' : variance < 0 ? 'Short' : 'Over';
+              const varianceColor = variance === 0 ? palette.success : variance < 0 ? palette.danger : palette.accent;
+              const showAlert = Math.abs(variance) >= VARIANCE_ALERT_CENTS;
+
+              return (
+                <View key={report.id} style={[styles.transactionCard, { borderColor: `${palette.text}22`, backgroundColor: `${palette.surface}C8` }]}
+                  >
+                  <View style={styles.transactionHeader}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[styles.rowTitle, { color: palette.text }]} numberOfLines={1}>
+                        Shift {report.id.slice(0, 8).toUpperCase()}
+                      </Text>
+                      <Text style={[styles.rowMeta, { color: palette.mutedText }]}>
+                        {dateTimeFormatter.format(new Date(report.createdAt))}
+                      </Text>
+                    </View>
+                    <View style={styles.transactionHeaderRight}>
+                      <Text style={[styles.transactionTotal, { color: palette.primary }]}>{formatCurrency(report.actualCashCents)}</Text>
+                      <Text style={[styles.transactionStatus, { color: varianceColor }]}>{varianceLabel}</Text>
+                    </View>
+                  </View>
+
+                  <View style={styles.transactionFooterRow}>
+                    <Text style={[styles.transactionFooterText, { color: palette.mutedText }]}>Expected {formatCurrency(report.expectedCashCents)}</Text>
+                    <Text style={[styles.transactionFooterText, { color: varianceColor }]}>Variance {formatCurrency(variance)}</Text>
+                  </View>
+
+                  <View style={styles.transactionDetails}>
+                    <View style={styles.transactionDetailGrid}>
+                      <View style={styles.transactionMetric}>
+                        <Text style={[styles.transactionMetricLabel, { color: palette.mutedText }]}>Cash sales</Text>
+                        <Text style={[styles.transactionMetricValue, { color: palette.text }]}>{formatCurrency(report.totalCashSalesCents)}</Text>
+                      </View>
+                      <View style={styles.transactionMetric}>
+                        <Text style={[styles.transactionMetricLabel, { color: palette.mutedText }]}>Pay-ins</Text>
+                        <Text style={[styles.transactionMetricValue, { color: palette.text }]}>{formatCurrency(report.payInsCents)}</Text>
+                      </View>
+                      <View style={styles.transactionMetric}>
+                        <Text style={[styles.transactionMetricLabel, { color: palette.mutedText }]}>Payouts</Text>
+                        <Text style={[styles.transactionMetricValue, { color: palette.text }]}>{formatCurrency(report.payoutsCents)}</Text>
+                      </View>
+                    </View>
+
+                    <Text style={[styles.transactionSectionLabel, { color: palette.mutedText }]}>Non-cash payments</Text>
+                    <View style={styles.transactionDetailGrid}>
+                      <View style={styles.transactionMetric}>
+                        <Text style={[styles.transactionMetricLabel, { color: palette.mutedText }]}>Card</Text>
+                        <Text style={[styles.transactionMetricValue, { color: palette.text }]}>{formatCurrency(report.paymentsSummary.card ?? 0)}</Text>
+                      </View>
+                      <View style={styles.transactionMetric}>
+                        <Text style={[styles.transactionMetricLabel, { color: palette.mutedText }]}>QR</Text>
+                        <Text style={[styles.transactionMetricValue, { color: palette.text }]}>{formatCurrency(report.paymentsSummary.qr ?? 0)}</Text>
+                      </View>
+                    </View>
+                    {showAlert ? (
+                      <Text style={[styles.inlineHint, { color: palette.danger }]}>Variance exceeds alert threshold.</Text>
+                    ) : null}
+                  </View>
+                </View>
+              );
+            })}
+          </View>
+        ) : (
+          <Text style={[styles.cardBody, { color: palette.mutedText }]}>No shift reports synced yet.</Text>
+        )}
       </GlassPanel>
     </View>
   );
@@ -825,11 +1221,46 @@ export const AdminDashboardScreen = () => {
       </GlassPanel>
 
       <GlassPanel>
-        <Text style={[styles.sectionTitle, { color: palette.text }]}>Products</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Text style={[styles.sectionTitle, { color: palette.text }]}>Products</Text>
+          {!productBulkMode ? (
+            <Pressable onPress={() => setProductBulkMode(true)} style={[styles.ghostButton, { borderColor: `${palette.text}33` }]}>
+              <Text style={[styles.ghostButtonText, { color: palette.text }]}>Bulk select</Text>
+            </Pressable>
+          ) : (
+            <View style={{ flexDirection: 'row' }}>
+              <Pressable onPress={confirmDeleteSelectedProducts} style={[styles.ghostButton, { borderColor: `${palette.text}33`, marginRight: 6 }]}>
+                <Text style={[styles.ghostButtonText, { color: palette.text }]}>Delete selected ({Object.keys(selectedProductIds).length})</Text>
+              </Pressable>
+              <Pressable onPress={() => { setProductBulkMode(false); setSelectedProductIds({}); }} style={[styles.ghostButton, { borderColor: `${palette.text}33` }]}>
+                <Text style={[styles.ghostButtonText, { color: palette.text }]}>Cancel</Text>
+              </Pressable>
+            </View>
+          )}
+        </View>
         {snapshot?.products.length ? (
           <View style={styles.inventoryGrid}>
             {snapshot.products.map((product) => (
-              <Pressable key={product.id} style={[styles.inventoryCard, { borderColor: productForm.id === product.id ? palette.primary : `${palette.text}22`, backgroundColor: `${palette.surface}C8` }]} onPress={() => selectProduct(product.id)}>
+              <Pressable
+                key={product.id}
+                style={[
+                  styles.inventoryCard,
+                  {
+                    borderColor: productForm.id === product.id ? palette.primary : `${palette.text}22`,
+                    backgroundColor: `${palette.surface}C8`,
+                  },
+                ]}
+                onPress={() => (productBulkMode ? toggleSelectProductId(product.id) : selectProduct(product.id))}
+                onLongPress={() => {
+                  setProductBulkMode(true);
+                  toggleSelectProductId(product.id);
+                }}
+              >
+                {productBulkMode && (
+                  <View style={{ position: 'absolute', top: 8, left: 8, zIndex: 2 }}>
+                    <Text style={{ color: selectedProductIds[product.id] ? palette.primary : palette.mutedText }}>{selectedProductIds[product.id] ? '✓' : '○'}</Text>
+                  </View>
+                )}
                 {productImagePreviewUrlById[product.id] ? <Image source={{ uri: productImagePreviewUrlById[product.id] ?? undefined }} style={styles.productCardImage} /> : null}
                 <Text style={[styles.rowTitle, { color: palette.text }]} numberOfLines={1}>{product.name}</Text>
                 <Text style={[styles.inventoryMeta, { color: palette.mutedText }]} numberOfLines={2}>
@@ -877,19 +1308,47 @@ export const AdminDashboardScreen = () => {
           <Pressable style={({ pressed }) => [styles.primaryButton, { backgroundColor: palette.primary, opacity: pressed ? 0.88 : 1 }]} onPress={handleSaveInventory}>
             <Text style={styles.primaryButtonText}>Save Ingredient</Text>
           </Pressable>
+          <Pressable style={({ pressed }) => [styles.ghostButton, { borderColor: `${palette.text}33`, opacity: pressed ? 0.88 : 1 }]} onPress={handleDeleteInventory}>
+            <Text style={[styles.ghostButtonText, { color: palette.text }]}>Delete</Text>
+          </Pressable>
         </View>
       </GlassPanel>
 
       <GlassPanel>
-        <Text style={[styles.sectionTitle, { color: palette.text }]}>Ingredients Inventory</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Text style={[styles.sectionTitle, { color: palette.text }]}>Ingredients Inventory</Text>
+          {!inventoryBulkMode ? (
+            <Pressable onPress={() => setInventoryBulkMode(true)} style={[styles.ghostButton, { borderColor: `${palette.text}33` }]}>
+              <Text style={[styles.ghostButtonText, { color: palette.text }]}>Bulk select</Text>
+            </Pressable>
+          ) : (
+            <View style={{ flexDirection: 'row' }}>
+              <Pressable onPress={confirmDeleteSelectedInventory} style={[styles.ghostButton, { borderColor: `${palette.text}33`, marginRight: 6 }]}>
+                <Text style={[styles.ghostButtonText, { color: palette.text }]}>Delete selected ({Object.keys(selectedInventoryIds).length})</Text>
+              </Pressable>
+              <Pressable onPress={() => { setInventoryBulkMode(false); setSelectedInventoryIds({}); }} style={[styles.ghostButton, { borderColor: `${palette.text}33` }]}>
+                <Text style={[styles.ghostButtonText, { color: palette.text }]}>Cancel</Text>
+              </Pressable>
+            </View>
+          )}
+        </View>
         {snapshot?.inventoryItems.length ? (
           <View style={styles.inventoryGrid}>
             {snapshot.inventoryItems.map((item) => (
               <Pressable
                 key={item.id}
                 style={[styles.inventoryCard, { borderColor: `${palette.text}22`, backgroundColor: `${palette.surface}C8` }]}
-                onPress={() => selectInventoryItem(item.id)}
+                onPress={() => (inventoryBulkMode ? toggleSelectInventoryId(item.id) : selectInventoryItem(item.id))}
+                onLongPress={() => {
+                  setInventoryBulkMode(true);
+                  toggleSelectInventoryId(item.id);
+                }}
               >
+                {inventoryBulkMode && (
+                  <View style={{ position: 'absolute', top: 8, left: 8, zIndex: 2 }}>
+                    <Text style={{ color: selectedInventoryIds[item.id] ? palette.primary : palette.mutedText }}>{selectedInventoryIds[item.id] ? '✓' : '○'}</Text>
+                  </View>
+                )}
                 <Text style={[styles.rowTitle, { color: palette.text }]} numberOfLines={1}>{item.name}</Text>
                 <Text style={[styles.inventoryMeta, { color: palette.mutedText }]}>{item.sku ? `SKU: ${item.sku}` : 'No SKU'}</Text>
                 <Text style={[styles.inventoryMeta, { color: palette.mutedText }]}>{`${item.quantity} ${item.unit ?? 'pcs'}`}</Text>
@@ -1015,16 +1474,14 @@ export const AdminDashboardScreen = () => {
         <Pressable style={[styles.primaryButton, { backgroundColor: palette.primary, marginTop: 6 }]} onPress={handleSaveBranding}>
           <Text style={styles.primaryButtonText}>Save Branding</Text>
         </Pressable>
-
-        <Pressable style={[styles.ghostButton, { borderColor: `${palette.text}33`, marginTop: 10 }]} onPress={signOut}>
-          <Text style={[styles.ghostButtonText, { color: palette.text }]}>Logout</Text>
-        </Pressable>
       </GlassPanel>
     </View>
   );
 
   const tabContent = {
     overview: renderAnalytics(),
+    transactions: renderTransactions(),
+    shiftReports: renderShiftReports(),
     products: renderProducts(),
     inventory: renderInventory(),
     categories: renderCategories(),
@@ -1034,6 +1491,8 @@ export const AdminDashboardScreen = () => {
 
   const navTabs: Array<[AdminTab, string]> = [
     ['overview', 'Overview'],
+    ['transactions', 'Transactions'],
+    ['shiftReports', 'Shift Reports'],
     ['products', 'Products'],
     ['inventory', 'Ingredients'],
     ['categories', 'Categories'],
@@ -1043,12 +1502,27 @@ export const AdminDashboardScreen = () => {
 
   const navContent = (
     <>
-      {navTabs.map(([tab, label]) => (
-        <Pressable key={tab} onPress={() => setActiveTab(tab)} style={[styles.navItem, isLandscape ? styles.navItemLandscape : null]}>
-          <Text style={[styles.navText, { color: activeTab === tab ? palette.primary : palette.mutedText }]}>{label}</Text>
-          {activeTab === tab ? <View style={[styles.navIndicator, { backgroundColor: palette.primary }]} /> : null}
+      <View style={[styles.navTabs, isLandscape ? styles.navTabsLandscape : styles.navTabsPortrait]}>
+        {navTabs.map(([tab, label]) => (
+          <Pressable key={tab} onPress={() => setActiveTab(tab)} style={[styles.navItem, isLandscape ? styles.navItemLandscape : styles.navItemPortrait]}>
+            <Text style={[styles.navText, { color: activeTab === tab ? palette.primary : palette.mutedText }]}>{label}</Text>
+            {activeTab === tab ? <View style={[styles.navIndicator, { backgroundColor: palette.primary }]} /> : null}
+          </Pressable>
+        ))}
+      </View>
+
+      <View style={styles.navSpacer} />
+
+      <View style={[styles.navFooter, isLandscape ? styles.navFooterLandscape : styles.navFooterPortrait]}>
+        {isOwner ? (
+          <Pressable onPress={clearAllData} style={[styles.navActionButton, { borderColor: `${palette.danger}55`, backgroundColor: `${palette.danger}18` }]}>
+            <Text style={[styles.navActionText, { color: palette.danger }]}>Clear data</Text>
+          </Pressable>
+        ) : null}
+        <Pressable onPress={signOut} style={[styles.navActionButton, { borderColor: `${palette.text}33`, backgroundColor: `${palette.surface}D0` }]}>
+          <Text style={[styles.navActionText, { color: palette.text }]}>Logout</Text>
         </Pressable>
-      ))}
+      </View>
     </>
   );
 
@@ -1458,12 +1932,140 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginBottom: 2,
   },
+  transactionList: {
+    gap: 10,
+  },
+  transactionCard: {
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 12,
+  },
+  transactionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  transactionHeaderRight: {
+    alignItems: 'flex-end',
+    gap: 2,
+  },
+  transactionTotal: {
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  transactionStatus: {
+    fontSize: 11,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+  },
+  transactionFooterRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 10,
+  },
+  transactionFooterText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  transactionToggle: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  transactionToggleText: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  transactionDetails: {
+    marginTop: 12,
+    gap: 10,
+  },
+  transactionDetailGrid: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  transactionMetric: {
+    flex: 1,
+    borderRadius: 12,
+    padding: 10,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+  },
+  transactionMetricLabel: {
+    fontSize: 10,
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+  },
+  transactionMetricValue: {
+    marginTop: 3,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  transactionSectionLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+  },
+  transactionItemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 8,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.08)',
+  },
+  navTabs: {
+    gap: 6,
+  },
+  navTabsLandscape: {
+    flex: 1,
+  },
+  navTabsPortrait: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    width: '100%',
+  },
+  navItemPortrait: {
+    width: '33.333%',
+    minHeight: 38,
+    justifyContent: 'center',
+  },
+  navSpacer: {
+    width: '100%',
+    minHeight: 10,
+  },
+  navFooter: {
+    gap: 8,
+  },
+  navFooterLandscape: {
+    marginTop: 'auto',
+  },
+  navFooterPortrait: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    width: '100%',
+  },
+  navActionButton: {
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+  },
+  navActionText: {
+    fontSize: 12,
+    fontWeight: '800',
+  },
   bottomNav: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     borderTopWidth: 1,
     paddingTop: 8,
     paddingBottom: 10,
     paddingHorizontal: 8,
+    gap: 8,
   },
   sideNav: {
     width: 124,
@@ -1474,12 +2076,11 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-start',
   },
   navItem: {
-    flex: 1,
     alignItems: 'center',
     gap: 4,
   },
   navItemLandscape: {
-    flex: 0,
+    width: '100%',
     minHeight: 38,
     justifyContent: 'center',
   },

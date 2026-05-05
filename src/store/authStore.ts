@@ -56,6 +56,15 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     try {
       const { data, error } = await supabase.auth.getSession();
       if (error) {
+        const errorMsg = error.message.toLowerCase();
+        // If refresh token is corrupted/missing, clear stored session and allow user to sign in again
+        if (errorMsg.includes('refresh token') || errorMsg.includes('invalid token')) {
+          await supabase.auth.signOut().catch(() => {
+            // ignore errors on signout
+          });
+          set({ loading: false, initialized: true, error: null, session: null, profile: null, preferences: null });
+          return;
+        }
         set({ loading: false, initialized: true, error: error.message });
         return;
       }
