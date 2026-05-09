@@ -2,13 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Image, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { listLocalCategories, listLocalProducts, type LocalCategory, type LocalProduct } from '../../services/offlineDb';
+import { getPendingMutationCount, listLocalCategories, listLocalProducts, type LocalCategory, type LocalProduct } from '../../services/offlineDb';
 import { resolveProductImageUrl } from '../../services/adminService';
 import { createSaleLocalFirst, getPosSnapshot, type PosSnapshot } from '../../services/posService';
 import { closeShift, getShiftSummary, loadActiveShift, openShift, recordShiftEvent, type ShiftSummary } from '../../services/shiftService';
 import { openCashDrawer, printZReport } from '../../services/posHardware';
 import { useAuthStore } from '../../store/authStore';
 import { useThemeStore } from '../../store/themeStore';
+import { supabase } from '../../lib/supabase';
 
 type DisplayCategory = 'all' | string;
 
@@ -160,16 +161,15 @@ export const PosLandscapeScreen = () => {
   const { profile, signOut } = useAuthStore();
   const { palette } = useThemeStore();
   const [snapshot, setSnapshot] = useState<PosSnapshot | null>(null);
+  const [isOnline, setIsOnline] = useState(true);
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
-  const [categoryTabs, setCategoryTabs] = useState<CategoryTab[]>([{ key: 'all', label: 'All' }]);
-  const [activeCategory, setActiveCategory] = useState<DisplayCategory>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [paymentMethod, setPaymentMethod] = useState<'cash' | 'card' | 'qr'>('cash');
   const [cart, setCart] = useState<Record<string, CartLine>>({});
   const [feedbackMessage, setFeedbackMessage] = useState<string>('Loading local POS data...');
   const [chargeOverride, setChargeOverride] = useState<string | null>(null);
   const [clockLabel, setClockLabel] = useState<string>('');
-  const [cashTenderInput, setCashTenderInput] = useState<string>('');
+
   const [productImageUrlById, setProductImageUrlById] = useState<Record<string, string | null>>({});
   const [activeShift, setActiveShift] = useState<Awaited<ReturnType<typeof loadActiveShift>>>(null);
   const [shiftSummary, setShiftSummary] = useState<ShiftSummary | null>(null);
@@ -182,10 +182,14 @@ export const PosLandscapeScreen = () => {
   const [payInOutReason, setPayInOutReason] = useState('');
   const [payInOutError, setPayInOutError] = useState<string | null>(null);
   const [showEodModal, setShowEodModal] = useState(false);
+  const [pendingSyncCount, setPendingSyncCount] = useState(0);
   const [denominationCounts, setDenominationCounts] = useState<Record<number, string>>(
     Object.fromEntries(DENOMINATIONS.map((value) => [value, '0'])) as Record<number, string>
   );
+  const [isClosingShift, setIsClosingShift] = useState(false);
+  const [eodError, setEodError] = useState<string | null>(null);
   const chargeResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
 
   const tenantId = profile?.tenant_id;
 
@@ -206,17 +210,7 @@ export const PosLandscapeScreen = () => {
 
     setCatalog(buildCatalog(products, categories));
     setProductImageUrlById(Object.fromEntries(imagePreviewEntries));
-    const tabs: CategoryTab[] = [
-      { key: 'all', label: 'All' },
-      ...categories.filter((category) => category.active).map((category) => ({ key: category.id, label: category.name })),
-    ];
-
-    const hasUnassigned = products.some((product) => !product.category_id || !categories.some((category) => category.id === product.category_id));
-    if (hasUnassigned) {
-      tabs.push({ key: 'unassigned', label: 'Unassigned' });
-    }
-
-    setCategoryTabs(tabs);
+    setPendingSyncCount(nextSnapshot.pendingMutations);
     setSnapshot(nextSnapshot);
     setFeedbackMessage(feedbackMessage ?? (products.length > 0 ? 'Local data is ready.' : 'No local products found in database.'));
   }, [tenantId]);
@@ -249,6 +243,66 @@ export const PosLandscapeScreen = () => {
   }, [loadShiftState]);
 
   useEffect(() => {
+    if (!tenantId) {
+      setPendingSyncCount(0);
+      return;
+    }
+
+    let isCancelled = false;
+
+    const refreshPendingSyncCount = async () => {
+      try {
+        const nextPendingSyncCount = await getPendingMutationCount(tenantId);
+        if (!isCancelled) {
+          setPendingSyncCount(nextPendingSyncCount);
+        }
+      } catch {
+        if (!isCancelled) {
+          setPendingSyncCount(0);
+        }
+      }
+    };
+
+    void refreshPendingSyncCount();
+    const timer = setInterval(refreshPendingSyncCount, 5000);
+
+    return () => {
+      isCancelled = true;
+      clearInterval(timer);
+    };
+  }, [tenantId]);
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    const checkConnectivity = async () => {
+      try {
+        if (!supabase) {
+          setIsOnline(false);
+          return;
+        }
+
+        const { error } = await supabase.from('tenants').select('id', { count: 'exact', head: true });
+        if (!isCancelled) {
+          setIsOnline(!error);
+        }
+      } catch {
+        if (!isCancelled) {
+          setIsOnline(false);
+        }
+      }
+    };
+
+    void checkConnectivity();
+    const timer = setInterval(checkConnectivity, 10000);
+
+    return () => {
+      isCancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
     const updateClock = () => {
       const now = new Date();
       setClockLabel(
@@ -274,25 +328,27 @@ export const PosLandscapeScreen = () => {
     };
   }, []);
 
-  const visibleProducts = useMemo(() => {
+  const productsByCategory = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
-
-    return catalog.filter((product) => {
-      const categoryMatch = activeCategory === 'all' || product.categoryKey === activeCategory;
-      const searchMatch =
-        !query ||
+    const filtered = catalog.filter((product) => {
+      return !query ||
         product.name.toLowerCase().includes(query) ||
         product.categoryLabel.toLowerCase().includes(query);
-
-      return categoryMatch && searchMatch;
     });
-  }, [activeCategory, catalog, searchQuery]);
 
-  useEffect(() => {
-    if (!categoryTabs.some((tab) => tab.key === activeCategory)) {
-      setActiveCategory('all');
-    }
-  }, [activeCategory, categoryTabs]);
+    const groups: Record<string, { label: string; products: CatalogItem[] }> = {};
+    filtered.forEach((product) => {
+      const key = product.categoryKey || 'uncategorized';
+      if (!groups[key]) {
+        groups[key] = { label: product.categoryLabel || 'Uncategorized', products: [] };
+      }
+      groups[key].products.push(product);
+    });
+
+    return Object.entries(groups).map(([key, value]) => ({ key, ...value }));
+  }, [catalog, searchQuery]);
+
+
 
   const cartLines = useMemo(() => Object.values(cart), [cart]);
 
@@ -309,23 +365,7 @@ export const PosLandscapeScreen = () => {
     };
   }, [cartLines]);
 
-  const cashTenderCents = useMemo(() => {
-    const normalized = cashTenderInput.trim();
 
-    if (!normalized) {
-      return 0;
-    }
-
-    const parsedPesos = Number(normalized.replace(/[^0-9]/g, ''));
-
-    if (!Number.isFinite(parsedPesos) || parsedPesos < 0) {
-      return 0;
-    }
-
-    return Math.round(parsedPesos * 100);
-  }, [cashTenderInput]);
-
-  const changeDueCents = useMemo(() => Math.max(0, cashTenderCents - totals.grandTotalCents), [cashTenderCents, totals.grandTotalCents]);
 
   const actualCashCents = useMemo(() => {
     return DENOMINATIONS.reduce((sum, denomination) => {
@@ -360,25 +400,7 @@ export const PosLandscapeScreen = () => {
     });
   }, []);
 
-  const handleAddCashBill = useCallback((billCents: number) => {
-    setCashTenderInput((current) => {
-      const parsedPesos = Number(current.trim().replace(/[^0-9]/g, '')) || 0;
-      return String(parsedPesos + billCents);
-    });
-  }, []);
 
-  const handleSetExactCash = useCallback(() => {
-    setCashTenderInput(String(Math.ceil(totals.grandTotalCents / 100)));
-  }, [totals.grandTotalCents]);
-
-  const handleClearCash = useCallback(() => {
-    setCashTenderInput('');
-  }, []);
-
-  const handleCashTenderInputChange = useCallback((value: string) => {
-    const normalized = value.replace(/[^0-9]/g, '');
-    setCashTenderInput(normalized);
-  }, []);
 
   const handleOpenShift = useCallback(async () => {
     if (!tenantId) {
@@ -392,15 +414,23 @@ export const PosLandscapeScreen = () => {
     }
 
     setOpeningError(null);
-    await openShift({
-      tenantId,
-      cashierProfileId: profile?.id ?? null,
-      startingCashCents,
-    });
 
-    setOpeningCashInput('');
-    await loadShiftState();
-  }, [loadShiftState, openingCashInput, profile?.id, tenantId]);
+    try {
+      const createdShift = await openShift({
+        tenantId,
+        cashierProfileId: profile?.id ?? null,
+        startingCashCents,
+      });
+
+      setActiveShift(createdShift);
+      setShiftSummary(await getShiftSummary(createdShift));
+      setShowOpeningModal(false);
+      setOpeningCashInput('');
+      setFeedbackMessage(`Shift opened with ${money(startingCashCents)} starting float.`);
+    } catch (error) {
+      setOpeningError(error instanceof Error ? error.message : 'Unable to open shift.');
+    }
+  }, [openingCashInput, profile?.id, tenantId]);
 
   const handleRecordPayInOut = useCallback(async () => {
     if (!tenantId || !activeShift) {
@@ -430,47 +460,62 @@ export const PosLandscapeScreen = () => {
   }, [activeShift, loadShiftState, payInOutAmount, payInOutReason, payInOutType, profile?.id, tenantId]);
 
   const handleCloseShift = useCallback(async () => {
-    if (!tenantId || !activeShift || !shiftSummary) {
+    if (!tenantId || !activeShift) {
+      setEodError('Missing shift or tenant data.');
       return;
     }
 
-    const breakdown = Object.fromEntries(
-      DENOMINATIONS.map((value) => [
-        String(value),
-        Number((denominationCounts[value] ?? '0').replace(/[^0-9]/g, '')) || 0,
-      ])
-    );
+    if (!shiftSummary) {
+      setEodError('Shift summary not loaded. Please wait or try again.');
+      return;
+    }
 
-    await closeShift({
-      shift: activeShift,
-      summary: shiftSummary,
-      actualCashCents,
-      denominationBreakdown: breakdown,
-    });
+    setIsClosingShift(true);
+    setEodError(null);
 
-    const reportLines = [
-      'TAKOPOS Z-REPORT',
-      `Shift: ${activeShift.id.slice(0, 8).toUpperCase()}`,
-      `Opened: ${new Date(activeShift.opened_at).toLocaleString('en-PH')}`,
-      `Closed: ${new Date().toLocaleString('en-PH')}`,
-      `Starting Float: ${money(shiftSummary.startingCashCents)}`,
-      `Cash Sales: ${money(shiftSummary.totalCashSalesCents)}`,
-      `Card Sales: ${money(shiftSummary.paymentsSummary.card)}`,
-      `QR Sales: ${money(shiftSummary.paymentsSummary.qr)}`,
-      `Pay-ins: ${money(shiftSummary.payInsCents)}`,
-      `Payouts: ${money(shiftSummary.payoutsCents)}`,
-      `Expected Cash: ${money(expectedCashCents)}`,
-      `Actual Cash: ${money(actualCashCents)}`,
-      `Variance: ${money(varianceCents)}`,
-    ];
+    try {
+      const breakdown = Object.fromEntries(
+        DENOMINATIONS.map((value) => [
+          String(value),
+          Number((denominationCounts[value] ?? '0').replace(/[^0-9]/g, '')) || 0,
+        ])
+      );
 
-    void printZReport(reportLines.join('\n'));
-    void openCashDrawer();
+      await closeShift({
+        shift: activeShift,
+        summary: shiftSummary,
+        actualCashCents,
+        denominationBreakdown: breakdown,
+      });
 
-    setDenominationCounts(Object.fromEntries(DENOMINATIONS.map((value) => [value, '0'])) as Record<number, string>);
-    setShowEodModal(false);
-    await loadShiftState();
-    setFeedbackMessage('Shift closed. Opening float required for the next shift.');
+      const reportLines = [
+        'TAKOPOS Z-REPORT',
+        `Shift: ${activeShift.id.slice(0, 8).toUpperCase()}`,
+        `Opened: ${new Date(activeShift.opened_at).toLocaleString('en-PH')}`,
+        `Closed: ${new Date().toLocaleString('en-PH')}`,
+        `Starting Float: ${money(shiftSummary.startingCashCents)}`,
+        `Cash Sales: ${money(shiftSummary.totalCashSalesCents)}`,
+        `Card Sales: ${money(shiftSummary.paymentsSummary.card)}`,
+        `QR Sales: ${money(shiftSummary.paymentsSummary.qr)}`,
+        `Pay-ins: ${money(shiftSummary.payInsCents)}`,
+        `Payouts: ${money(shiftSummary.payoutsCents)}`,
+        `Expected Cash: ${money(expectedCashCents)}`,
+        `Actual Cash: ${money(actualCashCents)}`,
+        `Variance: ${money(varianceCents)}`,
+      ];
+
+      void printZReport(reportLines.join('\n'));
+      void openCashDrawer();
+
+      setDenominationCounts(Object.fromEntries(DENOMINATIONS.map((value) => [value, '0'])) as Record<number, string>);
+      setShowEodModal(false);
+      await loadShiftState();
+      setFeedbackMessage('Shift closed. Opening float required for the next shift.');
+    } catch (error) {
+      setEodError(error instanceof Error ? error.message : 'Failed to close shift. Please try again.');
+    } finally {
+      setIsClosingShift(false);
+    }
   }, [
     activeShift,
     actualCashCents,
@@ -481,6 +526,7 @@ export const PosLandscapeScreen = () => {
     tenantId,
     varianceCents,
   ]);
+
 
   const handleUpdateQuantity = useCallback((key: string, delta: number) => {
     setCart((current) => {
@@ -497,6 +543,23 @@ export const PosLandscapeScreen = () => {
         void removed;
         return rest;
       }
+
+      return {
+        ...current,
+        [key]: {
+          ...existing,
+          quantity: nextQuantity,
+        },
+      };
+    });
+  }, []);
+
+  const handleSetQuantity = useCallback((key: string, value: string) => {
+    const nextQuantity = value === '' ? 0 : Number(value.replace(/[^0-9]/g, ''));
+
+    setCart((current) => {
+      const existing = current[key];
+      if (!existing) return current;
 
       return {
         ...current,
@@ -530,10 +593,7 @@ export const PosLandscapeScreen = () => {
       return;
     }
 
-    if (paymentMethod === 'cash' && cashTenderCents < totals.grandTotalCents) {
-      setFeedbackMessage('Cash received is less than the total due.');
-      return;
-    }
+
 
     try {
       await createSaleLocalFirst({
@@ -554,12 +614,7 @@ export const PosLandscapeScreen = () => {
 
       setCart({});
       setChargeOverride('Payment complete!');
-      setFeedbackMessage(
-        paymentMethod === 'cash' && changeDueCents > 0
-          ? `Sale saved locally and queued for sync. Change due: ${money(changeDueCents)}`
-          : 'Sale saved locally and queued for sync.'
-      );
-      setCashTenderInput('');
+      setFeedbackMessage('Sale saved locally and queued for sync.');
 
       if (chargeResetRef.current) {
         clearTimeout(chargeResetRef.current);
@@ -574,12 +629,13 @@ export const PosLandscapeScreen = () => {
     } catch (error) {
       setFeedbackMessage(error instanceof Error ? error.message : 'Failed to save local sale');
     }
-  }, [activeShift, cashTenderCents, cartLines, changeDueCents, loadPosData, loadShiftState, paymentMethod, profile?.id, tenantId, totals.grandTotalCents]);
+  }, [activeShift, cartLines, loadPosData, loadShiftState, paymentMethod, profile?.id, tenantId, totals.grandTotalCents]);
 
   const chargeLabel = chargeOverride ?? `Charge ${money(totals.grandTotalCents)}`;
   const catalogCount = snapshot?.productsCount ?? catalog.length;
-  const pendingCount = snapshot?.pendingMutations ?? 0;
   const salesCount = snapshot?.salesCount ?? 0;
+  const connectivityLabel = isOnline ? 'Terminal online' : 'Terminal offline';
+  const syncQueueLabel = pendingSyncCount > 0 ? `${pendingSyncCount} queued for sync` : 'Sync queue clear';
 
   return (
     <SafeAreaView style={[styles.safeArea, { backgroundColor: palette.background }]}>
@@ -621,86 +677,86 @@ export const PosLandscapeScreen = () => {
               />
             </View>
 
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.tabStrip}>
-              {categoryTabs.map((tab) => {
-                const active = activeCategory === tab.key;
-
-                return (
-                  <Pressable
-                    key={tab.key}
-                    style={[
-                      styles.categoryTab,
-                      {
-                        backgroundColor: active ? palette.surface : 'transparent',
-                        borderColor: active ? `${palette.text}22` : 'transparent',
-                      },
-                    ]}
-                    onPress={() => setActiveCategory(tab.key)}
-                  >
-                    <Text style={[styles.categoryTabText, { color: active ? palette.text : palette.mutedText }]}>{tab.label}</Text>
-                  </Pressable>
-                );
-              })}
-            </ScrollView>
+            <View style={styles.tabStrip}>
+              <Text style={[styles.sectionTitle, { color: palette.text }]}>Product Catalog</Text>
+            </View>
           </View>
 
           <ScrollView style={styles.catalogScroll} contentContainerStyle={styles.catalogContent} showsVerticalScrollIndicator={false}>
-            {visibleProducts.length === 0 ? (
+            {productsByCategory.length === 0 ? (
               <View style={styles.emptyCatalogState}>
                 <Text style={[styles.emptyCatalogGlyph, { color: palette.mutedText }]}>◫</Text>
                 <Text style={[styles.emptyCatalogTitle, { color: palette.text }]}>No products found</Text>
                 <Text style={[styles.emptyCatalogBody, { color: palette.mutedText }]}>No product rows are available in the local database yet.</Text>
               </View>
             ) : (
-              visibleProducts.map((product) => {
-                const inCart = Boolean(cart[product.key]);
-                const stockText = product.inventoryTracking
-                  ? product.stockCount < 20
-                    ? `⚠ ${Math.max(0, Math.round(product.stockCount))} left`
-                    : 'In stock'
-                  : 'Unlimited';
+              productsByCategory.map((group) => (
+                <View key={group.key} style={styles.categorySection}>
+                  <Text style={[styles.categoryHeaderLabel, { color: palette.primary }]}>{group.label.toUpperCase()}</Text>
+                  <View style={styles.categoryGrid}>
+                    {group.products.map((product) => {
+                      const inCart = Boolean(cart[product.key]);
+                      const stockText = product.inventoryTracking
+                        ? product.stockCount < 20
+                          ? `⚠ ${Math.max(0, Math.round(product.stockCount))} left`
+                          : 'In stock'
+                        : 'Unlimited';
 
-                return (
-                  <Pressable
-                    key={product.key}
-                    style={[
-                      styles.productCard,
-                      {
-                        backgroundColor: palette.surface,
-                        borderColor: inCart ? palette.primary : `${palette.text}10`,
-                      },
-                    ]}
-                    onPress={() => handleAddProduct(product)}
-                  >
-                    <View style={styles.productBadgeWrap}>
-                      <Text style={[styles.productBadge, { color: palette.primary }]}>✓</Text>
-                    </View>
-                    <View style={styles.productIconWrap}>
-                      {productImageUrlById[product.productId ?? ''] ? (
-                        <Image source={{ uri: productImageUrlById[product.productId ?? ''] ?? undefined }} style={styles.productImage} />
-                      ) : (
-                        <Text style={styles.productIcon}>{product.icon}</Text>
-                      )}
-                    </View>
-                    <Text style={[styles.productName, { color: palette.text }]} numberOfLines={2}>
-                      {product.name}
-                    </Text>
-                    <Text style={[styles.productPrice, { color: palette.text }]}>{money(product.priceCents)}</Text>
-                    <Text style={[styles.productStock, { color: product.stockCount < 20 ? palette.accent : palette.mutedText }]}>{stockText}</Text>
-                  </Pressable>
-                );
-              })
+                      return (
+                        <Pressable
+                          key={product.key}
+                          style={[
+                            styles.productCard,
+                            {
+                              backgroundColor: palette.surface,
+                              borderColor: inCart ? palette.primary : (product.inventoryTracking && product.stockCount < 10) ? palette.accent : `${palette.text}10`,
+                              borderWidth: (product.inventoryTracking && product.stockCount < 10) ? 2 : 1,
+                            },
+                          ]}
+                          onPress={() => handleAddProduct(product)}
+                        >
+                          {(product.inventoryTracking && product.stockCount < 10) && (
+                            <View style={[styles.lowStockBadge, { backgroundColor: palette.accent }]}>
+                              <Text style={styles.lowStockBadgeText}>LOW</Text>
+                            </View>
+                          )}
+                          <View style={styles.productBadgeWrap}>
+                            <Text style={[styles.productBadge, { color: palette.primary }]}>✓</Text>
+                          </View>
+                          <View style={styles.productIconWrap}>
+                            {productImageUrlById[product.productId ?? ''] ? (
+                              <Image source={{ uri: productImageUrlById[product.productId ?? ''] ?? undefined }} style={styles.productImage} />
+                            ) : (
+                              <Text style={styles.productIcon}>{product.icon}</Text>
+                            )}
+                          </View>
+                          <Text style={[styles.productName, { color: palette.text }]} numberOfLines={2}>
+                            {product.name}
+                          </Text>
+                          <Text style={[styles.productPrice, { color: palette.text }]}>{money(product.priceCents)}</Text>
+                          <Text style={[styles.productStock, { color: (product.inventoryTracking && product.stockCount < 10) ? palette.accent : palette.mutedText }]}>{stockText}</Text>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                </View>
+              ))
             )}
           </ScrollView>
 
           <View style={[styles.statusBar, { borderTopColor: `${palette.text}12` }]}>
             <View style={styles.statusItem}>
-              <View style={[styles.statusDot, { backgroundColor: palette.success }]} />
-              <Text style={[styles.statusText, { color: palette.mutedText }]}>Terminal online</Text>
+              <View
+                style={[
+                  styles.statusDot,
+                  { backgroundColor: isOnline ? palette.success : palette.accent },
+                ]}
+              />
+              <Text style={[styles.statusText, { color: palette.mutedText }]}>{connectivityLabel}</Text>
             </View>
             <View style={styles.statusItem}>
-              <View style={[styles.statusDot, { backgroundColor: palette.success }]} />
-              <Text style={[styles.statusText, { color: palette.mutedText }]}>Printer ready</Text>
+              <View style={[styles.statusDot, { backgroundColor: pendingSyncCount > 0 ? palette.accent : palette.success }]} />
+              <Text style={[styles.statusText, { color: palette.mutedText }]}>{syncQueueLabel}</Text>
             </View>
             <View style={styles.statusItem}>
               <Text style={[styles.statusText, styles.monoText, { color: palette.mutedText }]}>{clockLabel}</Text>
@@ -718,203 +774,154 @@ export const PosLandscapeScreen = () => {
             </View>
           </View>
 
+          <ScrollView style={styles.orderScroll} contentContainerStyle={styles.orderScrollContent} showsVerticalScrollIndicator={false}>
+            <View style={styles.orderStatsRow}>
+              <View style={[styles.orderStatPill, { backgroundColor: `${palette.text}08`, borderColor: `${palette.text}10` }]}>
+                <Text style={[styles.orderStatLabel, { color: palette.mutedText }]}>Products</Text>
+                <Text style={[styles.orderStatValue, { color: palette.text }]}>{catalogCount}</Text>
+              </View>
+              <View style={[styles.orderStatPill, { backgroundColor: `${palette.text}08`, borderColor: `${palette.text}10` }]}>
+                <Text style={[styles.orderStatLabel, { color: palette.mutedText }]}>Sales</Text>
+                <Text style={[styles.orderStatValue, { color: palette.text }]}>{salesCount}</Text>
+              </View>
+            </View>
 
-          <View style={styles.orderStatsRow}>
-            <View style={[styles.orderStatPill, { backgroundColor: `${palette.text}08`, borderColor: `${palette.text}10` }]}>
-              <Text style={[styles.orderStatLabel, { color: palette.mutedText }]}>Products</Text>
-              <Text style={[styles.orderStatValue, { color: palette.text }]}>{catalogCount}</Text>
+            <View style={[styles.shiftCard, { borderColor: `${palette.text}12`, backgroundColor: `${palette.background}F2` }]}>
+              <View style={styles.shiftHeaderRow}>
+                <Text style={[styles.shiftTitle, { color: palette.text }]}>Shift Status</Text>
+                <Text style={[styles.shiftBadge, { color: activeShift ? palette.success : palette.danger }]}>
+                  {activeShift ? 'Open' : 'Closed'}
+                </Text>
+              </View>
+              {activeShift ? (
+                <>
+                  <Text style={[styles.shiftMeta, { color: palette.mutedText }]}>Opened {new Date(activeShift.opened_at).toLocaleTimeString('en-PH')}</Text>
+                  <View style={styles.shiftTotalsRow}>
+                    <Text style={[styles.shiftLabel, { color: palette.mutedText }]}>Starting Float</Text>
+                    <Text style={[styles.shiftValue, { color: palette.text }]}>{money(shiftSummary?.startingCashCents ?? 0)}</Text>
+                  </View>
+                  <View style={styles.shiftTotalsRow}>
+                    <Text style={[styles.shiftLabel, { color: palette.mutedText }]}>Expected Cash</Text>
+                    <Text style={[styles.shiftValue, { color: palette.text }]}>{money(expectedCashCents)}</Text>
+                  </View>
+                </>
+              ) : (
+                <Text style={[styles.shiftMeta, { color: palette.mutedText }]}>Open a shift to start taking orders.</Text>
+              )}
+              <View style={styles.shiftActionRow}>
+                <Pressable
+                  onPress={() => {
+                    setPayInOutType('pay_out');
+                    setShowPayInOutModal(true);
+                  }}
+                  disabled={!activeShift}
+                  style={({ pressed }) => [
+                    styles.shiftActionButton,
+                    {
+                      borderColor: `${palette.text}22`,
+                      opacity: pressed ? 0.86 : activeShift ? 1 : 0.4,
+                    },
+                  ]}
+                >
+                  <Text style={[styles.shiftActionText, { color: palette.text }]}>Expenses</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => setShowEodModal(true)}
+                  disabled={!activeShift}
+                  style={({ pressed }) => [
+                    styles.shiftCloseButton,
+                    {
+                      backgroundColor: activeShift ? palette.accent : `${palette.accent}66`,
+                      opacity: pressed ? 0.9 : 1,
+                    },
+                  ]}
+                >
+                  <Text style={styles.shiftCloseText}>Close Register</Text>
+                </Pressable>
+              </View>
             </View>
-            <View style={[styles.orderStatPill, { backgroundColor: `${palette.text}08`, borderColor: `${palette.text}10` }]}>
-              <Text style={[styles.orderStatLabel, { color: palette.mutedText }]}>Sales</Text>
-              <Text style={[styles.orderStatValue, { color: palette.text }]}>{salesCount}</Text>
-            </View>
-          </View>
 
-          <View style={[styles.shiftCard, { borderColor: `${palette.text}12`, backgroundColor: `${palette.background}F2` }]}>
-            <View style={styles.shiftHeaderRow}>
-              <Text style={[styles.shiftTitle, { color: palette.text }]}>Shift Status</Text>
-              <Text style={[styles.shiftBadge, { color: activeShift ? palette.success : palette.danger }]}>
-                {activeShift ? 'Open' : 'Closed'}
-              </Text>
-            </View>
-            {activeShift ? (
-              <>
-                <Text style={[styles.shiftMeta, { color: palette.mutedText }]}>Opened {new Date(activeShift.opened_at).toLocaleTimeString('en-PH')}</Text>
-                <View style={styles.shiftTotalsRow}>
-                  <Text style={[styles.shiftLabel, { color: palette.mutedText }]}>Starting Float</Text>
-                  <Text style={[styles.shiftValue, { color: palette.text }]}>{money(shiftSummary?.startingCashCents ?? 0)}</Text>
-                </View>
-                <View style={styles.shiftTotalsRow}>
-                  <Text style={[styles.shiftLabel, { color: palette.mutedText }]}>Expected Cash</Text>
-                  <Text style={[styles.shiftValue, { color: palette.text }]}>{money(expectedCashCents)}</Text>
-                </View>
-              </>
-            ) : (
-              <Text style={[styles.shiftMeta, { color: palette.mutedText }]}>Open a shift to start taking orders.</Text>
-            )}
-            <View style={styles.shiftActionRow}>
-              <Pressable
-                onPress={() => setShowPayInOutModal(true)}
-                disabled={!activeShift}
-                style={({ pressed }) => [
-                  styles.shiftActionButton,
-                  {
-                    borderColor: `${palette.text}22`,
-                    opacity: pressed ? 0.86 : activeShift ? 1 : 0.4,
-                  },
-                ]}
-              >
-                <Text style={[styles.shiftActionText, { color: palette.text }]}>Pay-in / Payout</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => setShowEodModal(true)}
-                disabled={!activeShift}
-                style={({ pressed }) => [
-                  styles.shiftCloseButton,
-                  {
-                    backgroundColor: activeShift ? palette.accent : `${palette.accent}66`,
-                    opacity: pressed ? 0.9 : 1,
-                  },
-                ]}
-              >
-                <Text style={styles.shiftCloseText}>Close Register</Text>
-              </Pressable>
-            </View>
-          </View>
-
-          <View style={styles.orderItemsArea}>
             {cartLines.length === 0 ? (
               <View style={styles.emptyOrderState}>
                 <Text style={[styles.emptyOrderGlyph, { color: palette.mutedText }]}>◔</Text>
                 <Text style={[styles.emptyOrderText, { color: palette.mutedText }]}>Tap a product to add it to this order</Text>
               </View>
             ) : (
-              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.orderItemsContent}>
-                {cartLines.map((line) => (
-                  <View key={line.key} style={[styles.orderItem, { borderBottomColor: `${palette.text}08` }]}>
-                    <View style={[styles.orderItemIcon, { backgroundColor: `${palette.text}08` }]}>
-                      <Text style={styles.orderItemIconText}>{line.icon}</Text>
-                    </View>
-                    <View style={styles.orderItemInfo}>
-                      <Text style={[styles.orderItemName, { color: palette.text }]} numberOfLines={1}>
-                        {line.name}
-                      </Text>
-                      <Text style={[styles.orderItemSub, { color: palette.mutedText }]}>
-                        {money(line.priceCents)} each
-                      </Text>
-                    </View>
-                    <View style={styles.orderQty}>
-                      <Pressable style={[styles.qtyButton, { backgroundColor: `${palette.text}08`, borderColor: `${palette.text}10` }]} onPress={() => handleUpdateQuantity(line.key, -1)}>
-                        <Text style={[styles.qtyButtonText, { color: palette.text }]}>−</Text>
-                      </Pressable>
-                      <Text style={[styles.qtyValue, { color: palette.text }]}>{line.quantity}</Text>
-                      <Pressable style={[styles.qtyButton, { backgroundColor: `${palette.text}08`, borderColor: `${palette.text}10` }]} onPress={() => handleUpdateQuantity(line.key, 1)}>
-                        <Text style={[styles.qtyButtonText, { color: palette.text }]}>+</Text>
-                      </Pressable>
-                    </View>
-                    <Text style={[styles.orderItemTotal, { color: palette.text }]}>{money(line.priceCents * line.quantity)}</Text>
-                    <Pressable style={[styles.removeItemButton, { borderColor: `${palette.danger}55` }]} onPress={() => handleRemoveFromCart(line.key)}>
-                      <Text style={[styles.removeItemButtonText, { color: palette.danger }]}>Remove</Text>
+              cartLines.map((line) => (
+                <View key={line.key} style={[styles.orderItem, { borderBottomColor: `${palette.text}08` }]}>
+                  <View style={[styles.orderItemIcon, { backgroundColor: `${palette.text}08` }]}>
+                    <Text style={styles.orderItemIconText}>{line.icon}</Text>
+                  </View>
+                  <View style={styles.orderItemInfo}>
+                    <Text style={[styles.orderItemName, { color: palette.text }]} numberOfLines={1}>
+                      {line.name}
+                    </Text>
+                    <Text style={[styles.orderItemSub, { color: palette.mutedText }]}>
+                      {money(line.priceCents)} each
+                    </Text>
+                  </View>
+                  <View style={styles.orderQty}>
+                    <Pressable style={[styles.qtyButton, { backgroundColor: `${palette.text}08`, borderColor: `${palette.text}10` }]} onPress={() => handleUpdateQuantity(line.key, -1)}>
+                      <Text style={[styles.qtyButtonText, { color: palette.text }]}>−</Text>
+                    </Pressable>
+                    <TextInput
+                      style={[styles.qtyValue, { color: palette.text }]}
+                      value={String(line.quantity || '')}
+                      onChangeText={(val) => handleSetQuantity(line.key, val)}
+                      keyboardType="number-pad"
+                      selectTextOnFocus
+                      onBlur={() => {
+                        if (line.quantity <= 0) {
+                          handleRemoveFromCart(line.key);
+                        }
+                      }}
+                    />
+                    <Pressable style={[styles.qtyButton, { backgroundColor: `${palette.text}08`, borderColor: `${palette.text}10` }]} onPress={() => handleUpdateQuantity(line.key, 1)}>
+                      <Text style={[styles.qtyButtonText, { color: palette.text }]}>+</Text>
                     </Pressable>
                   </View>
-                ))}
-              </ScrollView>
+                  <Text style={[styles.orderItemTotal, { color: palette.text }]}>{money(line.priceCents * line.quantity)}</Text>
+                  <Pressable style={[styles.removeItemButton, { borderColor: `${palette.danger}55` }]} onPress={() => handleRemoveFromCart(line.key)}>
+                    <Text style={[styles.removeItemButtonText, { color: palette.danger }]}>Remove</Text>
+                  </Pressable>
+                </View>
+              ))
             )}
-          </View>
 
-          <View style={[styles.totalsBlock, { borderTopColor: `${palette.text}12` }]}>
-          
-            {paymentMethod === 'cash' ? (
-              <>
-                <View style={styles.totalRow}>
-                  <Text style={[styles.totalLabel, { color: palette.mutedText }]}>Cash Received</Text>
-                  <Text style={[styles.totalValue, { color: palette.text }, styles.monoText]}>{money(cashTenderCents)}</Text>
-                </View>
-                <View style={styles.totalRow}>
-                  <Text style={[styles.totalLabel, { color: palette.mutedText }]}>Change</Text>
-                  <Text style={[styles.totalValue, { color: palette.success }, styles.monoText]}>{money(changeDueCents)}</Text>
-                </View>
-              </>
-            ) : null}
-          </View>
-
-          <View style={[styles.paymentBlock, { borderTopColor: `${palette.text}12` }]}>
-            {paymentMethod === 'cash' ? (
-              <View style={styles.cashTenderBlock}>
-                <View style={styles.cashTenderHeader}>
-                  <Text style={[styles.cashTenderTitle, { color: palette.text }]}>Cash tender</Text>
-                  <View style={[styles.cashTenderBadge, { backgroundColor: `${palette.primary}22` }]}>
-                    <Text style={[styles.cashTenderBadgeText, { color: palette.primary }]}>{money(cashTenderCents)}</Text>
-                  </View>
-                </View>
-
-                <TextInput
-                  style={[styles.cashTenderInput, { color: palette.text, backgroundColor: palette.background, borderColor: `${palette.text}12` }]}
-                  value={cashTenderInput}
-                  onChangeText={handleCashTenderInputChange}
-                  placeholder="Enter cash paid"
-                  placeholderTextColor={palette.mutedText}
-                  keyboardType="number-pad"
-                  returnKeyType="done"
-                />
-
-                <View style={styles.billGrid}>
-                  {CASH_BILLS.map((bill) => (
-                    <Pressable
-                      key={bill}
-                      onPress={() => handleAddCashBill(bill)}
-                      style={({ pressed }) => [
-                        styles.billButton,
-                        {
-                          borderColor: `${palette.text}12`,
-                          backgroundColor: `${palette.surface}CC`,
-                          opacity: pressed ? 0.86 : 1,
-                        },
-                      ]}
-                    >
-                      <Text style={[styles.billButtonValue, { color: palette.text }]}>{money(bill * 100)}</Text>
-                    </Pressable>
-                  ))}
-                </View>
-
-                <View style={styles.cashTenderActions}>
-                  <Pressable style={({ pressed }) => [styles.cashActionButton, { borderColor: `${palette.text}22`, opacity: pressed ? 0.86 : 1 }]} onPress={handleSetExactCash}>
-                    <Text style={[styles.cashActionText, { color: palette.text }]}>Exact</Text>
-                  </Pressable>
-                  <Pressable style={({ pressed }) => [styles.cashActionButton, { borderColor: `${palette.text}22`, opacity: pressed ? 0.86 : 1 }]} onPress={handleClearCash}>
-                    <Text style={[styles.cashActionText, { color: palette.text }]}>Clear</Text>
-                  </Pressable>
-                </View>
-              </View>
-            ) : null}
-
-            <View style={styles.paymentMethods}>
-              {[
-                { key: 'cash', label: 'Cash', glyph: '$' },
-                { key: 'card', label: 'Card', glyph: '▥' },
-                { key: 'qr', label: 'QR', glyph: '▣' },
-              ].map((method) => {
-                const active = paymentMethod === method.key;
-
-                return (
-                  <Pressable
-                    key={method.key}
-                    style={[
-                      styles.paymentMethod,
-                      {
-                        backgroundColor: active ? `${palette.primary}20` : palette.surface,
-                        borderColor: active ? palette.primary : `${palette.text}12`,
-                      },
-                    ]}
-                    onPress={() => setPaymentMethod(method.key as 'cash' | 'card' | 'qr')}
-                  >
-                    <Text style={[styles.paymentMethodGlyph, { color: active ? palette.primary : palette.mutedText }]}>{method.glyph}</Text>
-                    <Text style={[styles.paymentMethodText, { color: active ? palette.primary : palette.mutedText }]}>{method.label}</Text>
-                  </Pressable>
-                );
-              })}
+            <View style={[styles.totalsBlock, { borderTopColor: `${palette.text}12` }]}>
             </View>
 
+            <View style={[styles.paymentBlock, { borderTopColor: `${palette.text}12` }]}>
+
+              <View style={styles.paymentMethods}>
+                {[
+                  { key: 'cash', label: 'Cash', glyph: '₱' },
+                  { key: 'qr', label: 'G-Cash / QR', glyph: '▣' },
+                ].map((method) => {
+                  const active = paymentMethod === method.key;
+
+                  return (
+                    <Pressable
+                      key={method.key}
+                      style={[
+                        styles.paymentMethod,
+                        {
+                          backgroundColor: active ? `${palette.primary}20` : palette.surface,
+                          borderColor: active ? palette.primary : `${palette.text}12`,
+                        },
+                      ]}
+                      onPress={() => setPaymentMethod(method.key as 'cash' | 'card' | 'qr')}
+                    >
+                      <Text style={[styles.paymentMethodGlyph, { color: active ? palette.primary : palette.mutedText }]}>{method.glyph}</Text>
+                      <Text style={[styles.paymentMethodText, { color: active ? palette.primary : palette.mutedText }]}>{method.label}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </View>
+          </ScrollView>
+
+          <View style={[styles.chargeBlock, { borderTopColor: `${palette.text}12` }]}>
             <Pressable
               style={[
                 styles.chargeButton,
@@ -926,7 +933,7 @@ export const PosLandscapeScreen = () => {
               disabled={totals.grandTotalCents <= 0 || !activeShift}
             >
               <Text style={styles.chargeButtonGlyph}>→</Text>
-              <Text style={styles.chargeButtonText}>{paymentMethod === 'cash' ? `Charge ${money(totals.grandTotalCents)} • Change ${money(changeDueCents)}` : chargeLabel}</Text>
+              <Text style={styles.chargeButtonText}>{`Charge ${money(totals.grandTotalCents)}`}</Text>
             </Pressable>
 
             <Text style={[styles.feedbackText, { color: palette.mutedText }]}>{feedbackMessage}</Text>
@@ -952,7 +959,7 @@ export const PosLandscapeScreen = () => {
             />
             {openingError ? <Text style={[styles.modalError, { color: palette.danger }]}>{openingError}</Text> : null}
             <Pressable style={[styles.primaryModalButton, { backgroundColor: palette.primary }]} onPress={handleOpenShift}>
-              <Text style={styles.primaryModalText}>Start Shift</Text>
+              <Text style={[styles.primaryModalText, { color: '#FFFFFF' }]}>Start Shift</Text>
             </Pressable>
           </View>
         </View>
@@ -961,31 +968,8 @@ export const PosLandscapeScreen = () => {
       <Modal visible={showPayInOutModal} transparent animationType="fade" onRequestClose={() => setShowPayInOutModal(false)}>
         <View style={styles.modalOverlay}>
           <View style={[styles.modalCard, { backgroundColor: palette.surface }]}>
-            <Text style={[styles.modalTitle, { color: palette.text }]}>Pay-in / Payout</Text>
-            <Text style={[styles.modalHint, { color: palette.mutedText }]}>Log mid-day cash adjustments to keep the drawer balanced.</Text>
-            <View style={styles.toggleRow}>
-              {([
-                { key: 'pay_in', label: 'Pay-in' },
-                { key: 'pay_out', label: 'Payout' },
-              ] as const).map((option) => {
-                const active = payInOutType === option.key;
-                return (
-                  <Pressable
-                    key={option.key}
-                    onPress={() => setPayInOutType(option.key)}
-                    style={[
-                      styles.toggleChip,
-                      {
-                        borderColor: active ? palette.primary : `${palette.text}22`,
-                        backgroundColor: active ? `${palette.primary}22` : `${palette.surface}CC`,
-                      },
-                    ]}
-                  >
-                    <Text style={[styles.toggleChipText, { color: active ? palette.primary : palette.mutedText }]}>{option.label}</Text>
-                  </Pressable>
-                );
-              })}
-            </View>
+            <Text style={[styles.modalTitle, { color: palette.text }]}>Log Expense</Text>
+            <Text style={[styles.modalHint, { color: palette.mutedText }]}>Record a cash deduction from the drawer for store expenses.</Text>
             <TextInput
               style={[styles.modalInput, { color: palette.text, borderColor: `${palette.text}22`, backgroundColor: palette.background }]}
               value={payInOutAmount}
@@ -1020,70 +1004,94 @@ export const PosLandscapeScreen = () => {
       <Modal visible={showEodModal} transparent animationType="slide" onRequestClose={() => setShowEodModal(false)}>
         <View style={styles.modalOverlay}>
           <View style={[styles.eodCard, { backgroundColor: palette.surface }]}>
-            <Text style={[styles.modalTitle, { color: palette.text }]}>End-of-Day Reconciliation</Text>
-            <Text style={[styles.modalHint, { color: palette.mutedText }]}>Count the drawer and confirm the totals before closing the shift.</Text>
-
-            <View style={[styles.eodSummaryCard, { backgroundColor: `${palette.background}F0`, borderColor: `${palette.text}12` }]}
+            <ScrollView
+              style={styles.eodScrollView}
+              contentContainerStyle={styles.eodScrollContent}
+              showsVerticalScrollIndicator={false}
             >
-              <View style={styles.eodRow}>
-                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Expected Cash</Text>
-                <Text style={[styles.eodValue, { color: palette.text }]}>{money(expectedCashCents)}</Text>
-              </View>
-              <View style={styles.eodRow}>
-                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Actual Cash</Text>
-                <Text style={[styles.eodValue, { color: palette.text }]}>{money(actualCashCents)}</Text>
-              </View>
-              <View style={styles.eodRow}>
-                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Variance</Text>
-                <Text style={[styles.eodValue, { color: varianceColor }]}>{money(varianceCents)}</Text>
-              </View>
-            </View>
+              <Text style={[styles.modalTitle, { color: palette.text }]}>End-of-Day Reconciliation</Text>
+              <Text style={[styles.modalHint, { color: palette.mutedText }]}>Count the drawer and confirm the totals before closing the shift.</Text>
 
-            <Text style={[styles.sectionLabel, { color: palette.mutedText }]}>Denomination Count</Text>
-            <View style={styles.denominationGrid}>
-              {DENOMINATIONS.map((value) => (
-                <View key={value} style={[styles.denominationCell, { borderColor: `${palette.text}12`, backgroundColor: `${palette.background}F2` }]}
-                >
-                  <Text style={[styles.denominationLabel, { color: palette.mutedText }]}>{money(value * 100)}</Text>
-                  <TextInput
-                    style={[styles.denominationInput, { color: palette.text, borderColor: `${palette.text}22` }]}
-                    keyboardType="number-pad"
-                    value={denominationCounts[value] ?? '0'}
-                    onChangeText={(nextValue) =>
-                      setDenominationCounts((current) => ({
-                        ...current,
-                        [value]: nextValue.replace(/[^0-9]/g, '') || '0',
-                      }))
-                    }
-                  />
+              <View style={[styles.eodSummaryCard, { backgroundColor: `${palette.background}F0`, borderColor: `${palette.text}12` }]}
+              >
+                <View style={styles.eodRow}>
+                  <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Expected Cash</Text>
+                  <Text style={[styles.eodValue, { color: palette.text }]}>{money(expectedCashCents)}</Text>
                 </View>
-              ))}
-            </View>
+                <View style={styles.eodRow}>
+                  <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Actual Cash</Text>
+                  <Text style={[styles.eodValue, { color: palette.text }]}>{money(actualCashCents)}</Text>
+                </View>
+                <View style={styles.eodRow}>
+                  <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Variance</Text>
+                  <Text style={[styles.eodValue, { color: varianceColor }]}>{money(varianceCents)}</Text>
+                </View>
+              </View>
 
-            <Text style={[styles.sectionLabel, { color: palette.mutedText }]}>Sales Summary</Text>
-            <View style={[styles.eodSummaryCard, { backgroundColor: `${palette.background}F0`, borderColor: `${palette.text}12` }]}>
-              <View style={styles.eodRow}>
-                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Cash Sales</Text>
-                <Text style={[styles.eodValue, { color: palette.text }]}>{money(shiftSummary?.totalCashSalesCents ?? 0)}</Text>
+              <Text style={[styles.sectionLabel, { color: palette.mutedText }]}>Denomination Count</Text>
+              <View style={styles.denominationGrid}>
+                {DENOMINATIONS.map((value) => (
+                  <View key={value} style={[styles.denominationCell, { borderColor: `${palette.text}12`, backgroundColor: `${palette.background}F2` }]}
+                  >
+                    <Text style={[styles.denominationLabel, { color: palette.mutedText }]}>{money(value * 100)}</Text>
+                    <TextInput
+                      style={[styles.denominationInput, { color: palette.text, borderColor: `${palette.text}22` }]}
+                      keyboardType="number-pad"
+                      value={denominationCounts[value] ?? '0'}
+                      onChangeText={(nextValue) =>
+                        setDenominationCounts((current) => ({
+                          ...current,
+                          [value]: nextValue.replace(/[^0-9]/g, '') || '0',
+                        }))
+                      }
+                    />
+                  </View>
+                ))}
               </View>
-              <View style={styles.eodRow}>
-                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Card Sales</Text>
-                <Text style={[styles.eodValue, { color: palette.text }]}>{money(shiftSummary?.paymentsSummary.card ?? 0)}</Text>
-              </View>
-              <View style={styles.eodRow}>
-                <Text style={[styles.eodLabel, { color: palette.mutedText }]}>QR Sales</Text>
-                <Text style={[styles.eodValue, { color: palette.text }]}>{money(shiftSummary?.paymentsSummary.qr ?? 0)}</Text>
-              </View>
-            </View>
 
-            <View style={styles.modalActionRow}>
-              <Pressable style={[styles.ghostModalButton, { borderColor: `${palette.text}22` }]} onPress={() => setShowEodModal(false)}>
-                <Text style={[styles.ghostModalText, { color: palette.text }]}>Back</Text>
-              </Pressable>
-              <Pressable style={[styles.primaryModalButton, { backgroundColor: palette.accent }]} onPress={handleCloseShift}>
-                <Text style={styles.primaryModalText}>Confirm Close</Text>
-              </Pressable>
-            </View>
+              <Text style={[styles.sectionLabel, { color: palette.mutedText }]}>Sales Summary</Text>
+              <View style={[styles.eodSummaryCard, { backgroundColor: `${palette.background}F0`, borderColor: `${palette.text}12` }]}>
+                <View style={styles.eodRow}>
+                  <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Cash Sales</Text>
+                  <Text style={[styles.eodValue, { color: palette.text }]}>{money(shiftSummary?.totalCashSalesCents ?? 0)}</Text>
+                </View>
+                <View style={styles.eodRow}>
+                  <Text style={[styles.eodLabel, { color: palette.mutedText }]}>Card Sales</Text>
+                  <Text style={[styles.eodValue, { color: palette.text }]}>{money(shiftSummary?.paymentsSummary.card ?? 0)}</Text>
+                </View>
+                <View style={styles.eodRow}>
+                  <Text style={[styles.eodLabel, { color: palette.mutedText }]}>QR Sales</Text>
+                  <Text style={[styles.eodValue, { color: palette.text }]}>{money(shiftSummary?.paymentsSummary.qr ?? 0)}</Text>
+                </View>
+              </View>
+            </ScrollView>
+
+              {eodError ? <Text style={[styles.modalError, { color: palette.danger, marginBottom: 12 }]}>{eodError}</Text> : null}
+              <View style={styles.modalActionRow}>
+                <Pressable
+                  style={[styles.ghostModalButton, { borderColor: `${palette.text}22` }]}
+                  onPress={() => {
+                    setShowEodModal(false);
+                    setEodError(null);
+                  }}
+                  disabled={isClosingShift}
+                >
+                  <Text style={[styles.ghostModalText, { color: palette.text }]}>Back</Text>
+                </Pressable>
+                <Pressable
+                  style={[
+                    styles.primaryModalButton,
+                    {
+                      backgroundColor: isClosingShift ? `${palette.accent}88` : palette.accent,
+                    }
+                  ]}
+                  onPress={handleCloseShift}
+                  disabled={isClosingShift}
+                >
+                  <Text style={styles.primaryModalText}>{isClosingShift ? 'Closing...' : 'Confirm Close'}</Text>
+                </Pressable>
+              </View>
+
           </View>
         </View>
       </Modal>
@@ -1222,7 +1230,17 @@ const styles = StyleSheet.create({
     borderRadius: 18,
     padding: 18,
     gap: 12,
+    height: '90%',
     maxHeight: '90%',
+  },
+  eodScrollView: {
+    flex: 1,
+    minHeight: 0,
+  },
+  eodScrollContent: {
+    gap: 12,
+    flexGrow: 1,
+    paddingBottom: 4,
   },
   modalTitle: {
     fontSize: 18,
@@ -1413,6 +1431,19 @@ const styles = StyleSheet.create({
   catalogContent: {
     paddingHorizontal: 20,
     paddingVertical: 16,
+  },
+  categorySection: {
+    marginBottom: 24,
+  },
+  categoryHeaderLabel: {
+    fontSize: 13,
+    fontWeight: '800',
+    letterSpacing: 1,
+    marginBottom: 12,
+    marginLeft: 4,
+    opacity: 0.8,
+  },
+  categoryGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 10,
@@ -1525,7 +1556,9 @@ const styles = StyleSheet.create({
     fontVariant: ['tabular-nums'],
   },
   orderPane: {
-    width: 380,
+    flex: 1,
+    minWidth: 340,
+    maxWidth: 440,
     flexShrink: 0,
     borderLeftWidth: StyleSheet.hairlineWidth,
   },
@@ -1617,12 +1650,11 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '700',
   },
-  orderItemsArea: {
+  orderScroll: {
     flex: 1,
     minHeight: 0,
-    paddingTop: 8,
   },
-  orderItemsContent: {
+  orderScrollContent: {
     paddingBottom: 8,
   },
   emptyOrderState: {
@@ -1691,10 +1723,12 @@ const styles = StyleSheet.create({
     lineHeight: 16,
   },
   qtyValue: {
-    minWidth: 20,
+    minWidth: 28,
+    height: 24,
     textAlign: 'center',
     fontSize: 13,
     fontWeight: '700',
+    padding: 0,
   },
   orderItemTotal: {
     width: 70,
@@ -1813,6 +1847,12 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   paymentBlock: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 18,
+    paddingTop: 12,
+    gap: 8,
+  },
+  chargeBlock: {
     borderTopWidth: StyleSheet.hairlineWidth,
     paddingHorizontal: 18,
     paddingTop: 12,

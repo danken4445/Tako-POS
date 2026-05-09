@@ -39,6 +39,7 @@ export type LocalInventoryItem = {
   tenant_id: string;
   sku: string | null;
   name: string;
+  category: string | null;
   quantity: number;
   unit: string | null;
   updated_at: string;
@@ -193,6 +194,7 @@ type SyncCursorRow = {
   inventory_cursor: string | null;
   categories_cursor: string | null;
   staff_cursor: string | null;
+  sales_cursor: string | null;
   updated_at: string;
 };
 
@@ -201,6 +203,19 @@ const ISO_MIN_DATE = '1970-01-01T00:00:00.000Z';
 const nowIso = (): string => new Date().toISOString();
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const isUuid = (value: string | null | undefined): value is string => typeof value === 'string' && UUID_REGEX.test(value);
+
+let shiftEventTypeColumn: 'type' | 'event_type' | null = null;
+
+const getShiftEventTypeColumn = async (db: SQLite.SQLiteDatabase): Promise<'type' | 'event_type'> => {
+  if (shiftEventTypeColumn) {
+    return shiftEventTypeColumn;
+  }
+
+  const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(local_shift_events)');
+  const columnNames = new Set(columns.map((column) => column.name));
+  shiftEventTypeColumn = columnNames.has('type') ? 'type' : 'event_type';
+  return shiftEventTypeColumn;
+};
 
 const createLocalId = (): string => {
   if (typeof globalThis.crypto?.randomUUID === 'function') {
@@ -534,6 +549,7 @@ export const initializeOfflineDb = async (): Promise<void> => {
       tenant_id TEXT NOT NULL,
       sku TEXT,
       name TEXT NOT NULL,
+      category TEXT,
       quantity REAL NOT NULL DEFAULT 0,
       unit TEXT,
       updated_at TEXT NOT NULL,
@@ -650,6 +666,7 @@ export const initializeOfflineDb = async (): Promise<void> => {
       inventory_cursor TEXT,
       categories_cursor TEXT,
       staff_cursor TEXT,
+      sales_cursor TEXT,
       updated_at TEXT NOT NULL
     );
   `);
@@ -740,6 +757,22 @@ export const initializeOfflineDb = async (): Promise<void> => {
   `).catch(() => undefined);
 
   await db.execAsync(`
+    ALTER TABLE local_shift_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'pay_in';
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_events ADD COLUMN amount_cents INTEGER NOT NULL DEFAULT 0;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_events ADD COLUMN reason TEXT;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_events ADD COLUMN cashier_profile_id TEXT;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
     ALTER TABLE local_sale_items ADD COLUMN cost_price_cents INTEGER NOT NULL DEFAULT 0;
   `).catch(() => undefined);
 
@@ -764,8 +797,68 @@ export const initializeOfflineDb = async (): Promise<void> => {
   `).catch(() => undefined);
 
   await db.execAsync(`
+    ALTER TABLE local_inventory_items ADD COLUMN category TEXT;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
     CREATE INDEX IF NOT EXISTS idx_pending_mutations_retry_window
     ON pending_mutations (tenant_id, next_attempt_at, attempts);
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE sync_cursors ADD COLUMN sales_cursor TEXT;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN starting_cash_cents INTEGER NOT NULL DEFAULT 0;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN cashier_profile_id TEXT;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN total_cash_sales_cents INTEGER NOT NULL DEFAULT 0;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN cash_refunds_cents INTEGER NOT NULL DEFAULT 0;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN pay_ins_cents INTEGER NOT NULL DEFAULT 0;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN payouts_cents INTEGER NOT NULL DEFAULT 0;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN expected_cash_cents INTEGER NOT NULL DEFAULT 0;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN actual_cash_cents INTEGER NOT NULL DEFAULT 0;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN variance_cents INTEGER NOT NULL DEFAULT 0;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN denomination_breakdown_json TEXT;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN payments_summary_json TEXT;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shift_reports ADD COLUMN synced_at TEXT;
+  `).catch(() => undefined);
+
+  await db.execAsync(`
+    ALTER TABLE local_shifts ADD COLUMN starting_cash_cents INTEGER NOT NULL DEFAULT 0;
   `).catch(() => undefined);
 
   await migrateLegacyLocalIds(db);
@@ -890,6 +983,146 @@ export const listLocalSales = async (tenantId: string, limit = 50): Promise<Loca
     [tenantId, limit]
   );
 };
+
+  export const upsertLocalSales = async (
+    sales: Array<{
+      id: string;
+      tenant_id: string;
+      cashier_profile_id: string | null;
+      total_cents: number;
+      gross_profit_cents: number;
+      expenses_cents: number;
+      net_profit_cents: number;
+      payment_method: string;
+      status: string;
+      created_at: string;
+      updated_at: string;
+      synced_at: string | null;
+    }>
+  ): Promise<void> => {
+    if (sales.length === 0) {
+      return;
+    }
+
+    await initializeOfflineDb();
+    const db = await getDb();
+
+    await db.withTransactionAsync(async () => {
+      for (const sale of sales) {
+        await db.runAsync(
+          `
+            INSERT INTO local_sales (
+              id,
+              tenant_id,
+              cashier_profile_id,
+              total_cents,
+              gross_profit_cents,
+              expenses_cents,
+              net_profit_cents,
+              payment_method,
+              status,
+              created_at,
+              updated_at,
+              synced_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              tenant_id = excluded.tenant_id,
+              cashier_profile_id = excluded.cashier_profile_id,
+              total_cents = excluded.total_cents,
+              gross_profit_cents = excluded.gross_profit_cents,
+              expenses_cents = excluded.expenses_cents,
+              net_profit_cents = excluded.net_profit_cents,
+              payment_method = excluded.payment_method,
+              status = excluded.status,
+              created_at = excluded.created_at,
+              updated_at = excluded.updated_at,
+              synced_at = excluded.synced_at
+          `,
+          [
+            sale.id,
+            sale.tenant_id,
+            sale.cashier_profile_id,
+            sale.total_cents,
+            sale.gross_profit_cents,
+            sale.expenses_cents,
+            sale.net_profit_cents,
+            sale.payment_method,
+            sale.status,
+            sale.created_at,
+            sale.updated_at,
+            sale.synced_at,
+          ]
+        );
+      }
+    });
+  };
+
+  export const upsertLocalSaleItems = async (
+    items: Array<{
+      id: string;
+      sale_id: string;
+      product_id: string | null;
+      tenant_id: string;
+      quantity: number;
+      unit_price_cents: number;
+      cost_price_cents: number;
+      selling_price_cents: number;
+      gross_margin_cents: number;
+      created_at: string;
+    }>
+  ): Promise<void> => {
+    if (items.length === 0) {
+      return;
+    }
+
+    await initializeOfflineDb();
+    const db = await getDb();
+
+    await db.withTransactionAsync(async () => {
+      for (const item of items) {
+        await db.runAsync(
+          `
+            INSERT INTO local_sale_items (
+              id,
+              sale_id,
+              product_id,
+              tenant_id,
+              quantity,
+              unit_price_cents,
+              cost_price_cents,
+              selling_price_cents,
+              gross_margin_cents,
+              created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              sale_id = excluded.sale_id,
+              product_id = excluded.product_id,
+              tenant_id = excluded.tenant_id,
+              quantity = excluded.quantity,
+              unit_price_cents = excluded.unit_price_cents,
+              cost_price_cents = excluded.cost_price_cents,
+              selling_price_cents = excluded.selling_price_cents,
+              gross_margin_cents = excluded.gross_margin_cents,
+              created_at = excluded.created_at
+          `,
+          [
+            item.id,
+            item.sale_id,
+            item.product_id,
+            item.tenant_id,
+            item.quantity,
+            item.unit_price_cents,
+            item.cost_price_cents,
+            item.selling_price_cents,
+            item.gross_margin_cents,
+            item.created_at,
+          ]
+        );
+      }
+    });
+  };
 
 export const upsertLocalProducts = async (products: LocalProduct[]): Promise<void> => {
   if (products.length === 0) {
@@ -1162,13 +1395,13 @@ export const createLocalSale = async (input: LocalSaleInput): Promise<string> =>
             const linkedMultiplier = Number(product.deduction_multiplier ?? 1);
 
             if (!Number.isFinite(linkedMultiplier) || linkedMultiplier <= 0) {
-              throw new Error(`Invalid linked inventory multiplier for item ${item.product_id}`);
+              throw new Error(`Invalid linked inventory multiplier for "${product.name}"`);
             }
 
             for (const linkedInventoryId of linkedInventoryIds) {
-              const linkedInventory = await db.getFirstAsync<{ id: string; quantity: number }>(
+              const linkedInventory = await db.getFirstAsync<{ id: string; quantity: number; name: string }>(
                 `
-                  SELECT id, quantity
+                  SELECT id, quantity, name
                   FROM local_inventory_items
                   WHERE id = ?
                     AND tenant_id = ?
@@ -1179,12 +1412,12 @@ export const createLocalSale = async (input: LocalSaleInput): Promise<string> =>
               );
 
               if (!linkedInventory) {
-                throw new Error(`Linked inventory item not found for item ${item.product_id}`);
+                throw new Error(`Linked ingredient not found for "${product.name}"`);
               }
 
               const projectedQuantity = (inventoryItemUpdates.get(linkedInventory.id) ?? linkedInventory.quantity) - quantity * linkedMultiplier;
               if (projectedQuantity < 0) {
-                throw new Error(`Insufficient linked inventory for item ${item.product_id}`);
+                throw new Error(`Insufficient "${linkedInventory.name}" for "${product.name}"`);
               }
 
               inventoryItemUpdates.set(linkedInventory.id, projectedQuantity);
@@ -1192,7 +1425,7 @@ export const createLocalSale = async (input: LocalSaleInput): Promise<string> =>
           } else if (Boolean(product.inventory_tracking)) {
             const projectedQuantity = (productStockUpdates.get(product.id) ?? product.stock_count) - quantity;
             if (projectedQuantity < 0) {
-              throw new Error(`Insufficient stock for item ${item.product_id}`);
+              throw new Error(`Insufficient stock for "${product.name}"`);
             }
 
             productStockUpdates.set(product.id, projectedQuantity);
@@ -1588,6 +1821,7 @@ export const createShift = async (input: {
       ]
     );
 
+    const eventTypeColumn = await getShiftEventTypeColumn(db);
     await db.runAsync(
       `
         INSERT INTO local_shift_events (
@@ -1595,7 +1829,7 @@ export const createShift = async (input: {
           shift_id,
           tenant_id,
           cashier_profile_id,
-          event_type,
+          ${eventTypeColumn},
           amount_cents,
           reason,
           created_at
@@ -1623,6 +1857,7 @@ export const addShiftEvent = async (input: {
   const eventId = createLocalId();
   const createdAt = nowIso();
 
+  const eventTypeColumn = await getShiftEventTypeColumn(db);
   await db.runAsync(
     `
       INSERT INTO local_shift_events (
@@ -1630,7 +1865,7 @@ export const addShiftEvent = async (input: {
         shift_id,
         tenant_id,
         cashier_profile_id,
-        event_type,
+        ${eventTypeColumn},
         amount_cents,
         reason,
         created_at
@@ -1646,9 +1881,10 @@ export const addShiftEvent = async (input: {
 export const listShiftEvents = async (shiftId: string): Promise<LocalShiftEvent[]> => {
   await initializeOfflineDb();
   const db = await getDb();
+  const eventTypeColumn = await getShiftEventTypeColumn(db);
   return db.getAllAsync<LocalShiftEvent>(
     `
-      SELECT id, shift_id, tenant_id, cashier_profile_id, event_type, amount_cents, reason, created_at
+      SELECT id, shift_id, tenant_id, cashier_profile_id, ${eventTypeColumn} as event_type, amount_cents, reason, created_at
       FROM local_shift_events
       WHERE shift_id = ?
       ORDER BY created_at ASC
@@ -1798,11 +2034,11 @@ export const clearTenantLocalData = async (tenantId: string): Promise<void> => {
 
 export const getSyncCursor = async (
   tenantId: string
-): Promise<{ productsCursor: string; inventoryCursor: string; categoriesCursor: string; staffCursor: string }> => {
+): Promise<{ productsCursor: string; inventoryCursor: string; categoriesCursor: string; staffCursor: string; salesCursor: string }> => {
   await initializeOfflineDb();
   const db = await getDb();
 
-  const row = await db.getFirstAsync<SyncCursorRow>('SELECT tenant_id, products_cursor, inventory_cursor, categories_cursor, staff_cursor, updated_at FROM sync_cursors WHERE tenant_id = ?', [
+  const row = await db.getFirstAsync<SyncCursorRow>('SELECT tenant_id, products_cursor, inventory_cursor, categories_cursor, staff_cursor, sales_cursor, updated_at FROM sync_cursors WHERE tenant_id = ?', [
     tenantId,
   ]);
 
@@ -1812,6 +2048,7 @@ export const getSyncCursor = async (
       inventoryCursor: ISO_MIN_DATE,
       categoriesCursor: ISO_MIN_DATE,
       staffCursor: ISO_MIN_DATE,
+      salesCursor: ISO_MIN_DATE,
     };
   }
 
@@ -1820,12 +2057,13 @@ export const getSyncCursor = async (
     inventoryCursor: row.inventory_cursor ?? ISO_MIN_DATE,
     categoriesCursor: row.categories_cursor ?? ISO_MIN_DATE,
     staffCursor: row.staff_cursor ?? ISO_MIN_DATE,
+    salesCursor: row.sales_cursor ?? ISO_MIN_DATE,
   };
 };
 
 export const updateSyncCursor = async (
   tenantId: string,
-  cursors: { productsCursor?: string; inventoryCursor?: string; categoriesCursor?: string; staffCursor?: string }
+  cursors: { productsCursor?: string; inventoryCursor?: string; categoriesCursor?: string; staffCursor?: string; salesCursor?: string }
 ): Promise<void> => {
   await initializeOfflineDb();
   const db = await getDb();
@@ -1835,19 +2073,21 @@ export const updateSyncCursor = async (
   const nextInventory = cursors.inventoryCursor ?? current.inventoryCursor;
   const nextCategories = cursors.categoriesCursor ?? current.categoriesCursor;
   const nextStaff = cursors.staffCursor ?? current.staffCursor;
+  const nextSales = cursors.salesCursor ?? current.salesCursor;
   const updatedAt = nowIso();
 
   await db.runAsync(
     `
-      INSERT INTO sync_cursors (tenant_id, products_cursor, inventory_cursor, categories_cursor, staff_cursor, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO sync_cursors (tenant_id, products_cursor, inventory_cursor, categories_cursor, staff_cursor, sales_cursor, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(tenant_id) DO UPDATE SET
         products_cursor = excluded.products_cursor,
         inventory_cursor = excluded.inventory_cursor,
         categories_cursor = excluded.categories_cursor,
         staff_cursor = excluded.staff_cursor,
+        sales_cursor = excluded.sales_cursor,
         updated_at = excluded.updated_at
     `,
-    [tenantId, nextProducts, nextInventory, nextCategories, nextStaff, updatedAt]
+    [tenantId, nextProducts, nextInventory, nextCategories, nextStaff, nextSales, updatedAt]
   );
 };

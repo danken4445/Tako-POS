@@ -143,6 +143,7 @@ export type InventoryInput = {
   tenant_id: string;
   sku: string | null;
   name: string;
+  category: string | null;
   quantity: number;
   unit: string | null;
 };
@@ -536,6 +537,7 @@ export const saveInventoryItem = async (input: InventoryInput): Promise<void> =>
     tenant_id: input.tenant_id,
     sku: input.sku,
     name: input.name,
+    category: input.category,
     quantity: input.quantity,
     unit: input.unit,
     updated_at: nowIso(),

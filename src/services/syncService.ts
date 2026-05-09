@@ -12,6 +12,8 @@ import {
   type LocalCategory,
   type LocalProduct,
   type LocalStaffMember,
+  upsertLocalSaleItems,
+  upsertLocalSales,
   upsertLocalStaffMembers,
   updateSyncCursor,
   upsertLocalInventoryItems,
@@ -122,10 +124,57 @@ type InventoryRow = {
   tenant_id: string;
   sku: string | null;
   name: string;
+  category: string | null;
   quantity: number;
   unit: string | null;
   updated_at: string;
   deleted_at?: string | null;
+};
+
+const mutationPriority = (tableName: string): number => {
+  if (tableName === 'inventory_items') {
+    return 0;
+  }
+
+  if (tableName === 'categories' || tableName === 'staff_members') {
+    return 1;
+  }
+
+  if (tableName === 'products') {
+    return 2;
+  }
+
+  if (tableName === 'sales' || tableName === 'shift_reports') {
+    return 3;
+  }
+
+  return 4;
+};
+
+type SaleRow = {
+  id: string;
+  tenant_id: string;
+  cashier_profile_id: string | null;
+  total_cents: number;
+  gross_profit_cents: number;
+  expenses_cents: number;
+  net_profit_cents: number;
+  payment_method: string;
+  status: string;
+  created_at: string;
+};
+
+type SaleItemRow = {
+  id: string;
+  sale_id: string;
+  product_id: string | null;
+  tenant_id: string;
+  quantity: number;
+  unit_price_cents: number;
+  cost_price_cents: number;
+  selling_price_cents: number;
+  gross_margin_cents: number;
+  created_at: string;
 };
 
 let syncTimer: ReturnType<typeof setInterval> | null = null;
@@ -175,6 +224,27 @@ const parseLinkedInventoryIds = (linkedIdsJson: string | null, fallbackLinkedId:
   }
 
   return fallbackLinkedId ? [fallbackLinkedId] : [];
+};
+
+const filterExistingInventoryIds = async (tenantId: string, inventoryIds: string[]): Promise<string[]> => {
+  const uniqueIds = Array.from(new Set(inventoryIds.filter(isUuid)));
+
+  if (!supabase || uniqueIds.length === 0) {
+    return [];
+  }
+
+  const { data, error } = await supabase
+    .from('inventory_items')
+    .select('id')
+    .eq('tenant_id', tenantId)
+    .in('id', uniqueIds);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const existingIds = new Set((data ?? []).map((row) => row.id as string));
+  return uniqueIds.filter((id) => existingIds.has(id));
 };
 
 const buildLinkedIdsMap = (links: ProductInventoryLinkRow[]): Map<string, string[]> => {
@@ -236,6 +306,7 @@ const toLocalInventory = (row: InventoryRow): LocalInventoryItem => ({
   tenant_id: row.tenant_id,
   sku: row.sku,
   name: row.name,
+  category: row.category,
   quantity: row.quantity,
   unit: row.unit,
   updated_at: row.updated_at,
@@ -320,7 +391,9 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
     const tenantId = assertRequiredUuid(product.tenant_id, 'products.tenant_id');
     let categoryId = toValidUuidOrNull(product.category_id);
     const linkedInventoryIds = parseLinkedInventoryIds(product.linked_inventory_item_ids_json, product.linked_inventory_item_id).filter(isUuid);
+    const existingLinkedInventoryIds = await filterExistingInventoryIds(tenantId, linkedInventoryIds);
     const linkedInventoryItemId = toValidUuidOrNull(product.linked_inventory_item_id);
+    const safeLinkedInventoryItemId = linkedInventoryItemId && existingLinkedInventoryIds.includes(linkedInventoryItemId) ? linkedInventoryItemId : null;
 
     if (categoryId) {
       const { data: categoryRow, error: categoryError } = await supabase
@@ -351,7 +424,7 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
         cost_price_cents: product.cost_price_cents,
         inventory_tracking: product.inventory_tracking,
         stock_count: product.stock_count,
-        linked_inventory_item_id: linkedInventoryItemId,
+        linked_inventory_item_id: safeLinkedInventoryItemId,
         deduction_multiplier: product.deduction_multiplier,
         active: product.active,
         deleted_at: product.deleted_at ?? null,
@@ -376,7 +449,7 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
 
     const existingRows = (existingLinks ?? []) as Array<{ inventory_item_id: string; deleted_at: string | null }>;
     const existingActiveIds = new Set(existingRows.filter((row) => !row.deleted_at).map((row) => row.inventory_item_id));
-    const desiredIds = Array.from(new Set(linkedInventoryIds));
+    const desiredIds = existingLinkedInventoryIds;
     const desiredIdSet = new Set(desiredIds);
 
     const idsToArchive = Array.from(existingActiveIds).filter((id) => !desiredIdSet.has(id));
@@ -429,6 +502,7 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
         tenant_id: tenantId,
         sku: item.sku,
         name: item.name,
+        category: item.category,
         quantity: item.quantity,
         unit: item.unit,
         deleted_at: item.deleted_at ?? null,
@@ -612,7 +686,14 @@ const pushMutation = async (tableName: string, payload: unknown): Promise<void> 
 };
 
 const pushPendingMutations = async (tenantId: string): Promise<void> => {
-  const pendingMutations = await getPendingMutations(tenantId, 100);
+  const pendingMutations = (await getPendingMutations(tenantId, 100)).sort((left, right) => {
+    const priorityDelta = mutationPriority(left.tableName) - mutationPriority(right.tableName);
+    if (priorityDelta !== 0) {
+      return priorityDelta;
+    }
+
+    return left.createdAt.localeCompare(right.createdAt);
+  });
 
   for (const mutation of pendingMutations) {
     if (!['UPSERT'].includes(mutation.operation)) {
@@ -625,6 +706,16 @@ const pushPendingMutations = async (tenantId: string): Promise<void> => {
       await markMutationSynced(mutation.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown sync failure';
+
+      console.error('[sync] mutation failed', {
+        tenantId,
+        mutationId: mutation.id,
+        tableName: mutation.tableName,
+        operation: mutation.operation,
+        attempts: mutation.attempts,
+        nextAttemptAt: mutation.nextAttemptAt,
+        error: message,
+      });
 
       if (isIrrecoverableMutationError(message)) {
         await markMutationSynced(mutation.id);
@@ -858,10 +949,61 @@ const pullInventory = async (tenantId: string, inventoryCursor: string): Promise
   return rows[rows.length - 1]?.updated_at ?? null;
 };
 
+const pullSales = async (tenantId: string, salesCursor: string): Promise<string | null> => {
+  if (!supabase) {
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from('sales')
+    .select('id, tenant_id, cashier_profile_id, total_cents, gross_profit_cents, expenses_cents, net_profit_cents, payment_method, status, created_at')
+    .eq('tenant_id', tenantId)
+    .gte('created_at', salesCursor)
+    .order('created_at', { ascending: true })
+    .limit(2000);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const rows = (data as SaleRow[]) ?? [];
+  if (rows.length === 0) {
+    return null;
+  }
+
+  const saleIds = rows.map((row) => row.id);
+  const { data: itemData, error: itemError } = await supabase
+    .from('sale_items')
+    .select('id, sale_id, product_id, tenant_id, quantity, unit_price_cents, cost_price_cents, selling_price_cents, gross_margin_cents, created_at')
+    .eq('tenant_id', tenantId)
+    .in('sale_id', saleIds);
+
+  if (itemError) {
+    throw new Error(itemError.message);
+  }
+
+  const items = (itemData as SaleItemRow[]) ?? [];
+
+  await upsertLocalSales(
+    rows.map((row) => ({
+      ...row,
+      updated_at: row.created_at,
+      synced_at: null,
+    }))
+  );
+
+  if (items.length > 0) {
+    await upsertLocalSaleItems(items);
+  }
+
+  return rows[rows.length - 1]?.created_at ?? null;
+};
+
 const pullRemoteUpdates = async (tenantId: string): Promise<void> => {
   const cursors = await getSyncCursor(tenantId);
   const pulledProducts = await pullProducts(tenantId, cursors.productsCursor);
   const pulledProductLinks = await pullProductLinkChanges(tenantId, cursors.productsCursor);
+  const nextSalesCursor = await pullSales(tenantId, cursors.salesCursor);
 
   const linkOnlyProductIds = pulledProductLinks.productIds.filter((productId) => !pulledProducts.productIds.includes(productId));
   if (linkOnlyProductIds.length > 0) {
@@ -873,7 +1015,7 @@ const pullRemoteUpdates = async (tenantId: string): Promise<void> => {
   const nextStaffCursor = await pullStaff(tenantId, cursors.staffCursor);
   const nextProductCursor = mergeCursor(pulledProducts.cursor, pulledProductLinks.cursor);
 
-  if (!nextProductCursor && !nextInventoryCursor && !nextCategoryCursor && !nextStaffCursor) {
+  if (!nextProductCursor && !nextInventoryCursor && !nextCategoryCursor && !nextStaffCursor && !nextSalesCursor) {
     return;
   }
 
@@ -882,6 +1024,7 @@ const pullRemoteUpdates = async (tenantId: string): Promise<void> => {
     inventoryCursor: nextInventoryCursor ?? undefined,
     categoriesCursor: nextCategoryCursor ?? undefined,
     staffCursor: nextStaffCursor ?? undefined,
+    salesCursor: nextSalesCursor ?? undefined,
   });
 };
 
@@ -921,8 +1064,11 @@ export const startSyncEngine = async (tenantId: string): Promise<void> => {
   }, SYNC_INTERVAL_MS);
 };
 
-export const triggerSyncNow = async (): Promise<void> => {
+export const triggerSyncNow = async (tenantId?: string): Promise<void> => {
   if (!activeTenantId) {
+    if (tenantId) {
+      await startSyncEngine(tenantId);
+    }
     return;
   }
 

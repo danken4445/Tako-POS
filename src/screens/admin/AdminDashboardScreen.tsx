@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Alert, Image, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View, useWindowDimensions } from 'react-native';
+import { Alert, Image, Modal, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View, useWindowDimensions } from 'react-native';
+import DraggableFlatList, { ScaleDecorator, RenderItemParams } from 'react-native-draggable-flatlist';
 import * as ImagePicker from 'expo-image-picker';
 import ColorPicker from 'react-native-wheel-color-picker';
 
@@ -27,6 +28,7 @@ import {
 import { useAuthStore } from '../../store/authStore';
 import { useThemeStore } from '../../store/themeStore';
 import type { TenantPalette } from '../../types/auth';
+import { SalesAnalyticsPanel } from './components/SalesAnalyticsPanel';
 
 type AdminTab = 'overview' | 'transactions' | 'shiftReports' | 'products' | 'inventory' | 'categories' | 'staff' | 'settings';
 
@@ -66,6 +68,7 @@ const defaultInventoryForm: InventoryInput = {
   tenant_id: '',
   sku: '',
   name: '',
+  category: '',
   quantity: 0,
   unit: 'pcs',
 };
@@ -85,6 +88,29 @@ const dateTimeFormatter = new Intl.DateTimeFormat('en-PH', {
   dateStyle: 'medium',
   timeStyle: 'short',
 });
+
+const dayFormatter = new Intl.DateTimeFormat('en-PH', {
+  weekday: 'long',
+  month: 'long',
+  day: 'numeric',
+});
+
+const formatRelativeTime = (date: Date): string => {
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffSeconds = Math.floor(diffMs / 1000);
+  const diffMinutes = Math.floor(diffSeconds / 60);
+  const diffHours = Math.floor(diffMinutes / 60);
+  const diffDays = Math.floor(diffHours / 24);
+
+  if (diffSeconds < 30) return 'just now';
+  if (diffSeconds < 60) return 'less than a minute ago';
+  if (diffMinutes < 60) return `${diffMinutes} minute${diffMinutes === 1 ? '' : 's'} ago`;
+  if (diffHours < 24) return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`;
+  if (diffDays === 1) return 'yesterday';
+  if (diffDays < 7) return `${diffDays} days ago`;
+  return dateTimeFormatter.format(date);
+};
 
 const VARIANCE_ALERT_CENTS = 500;
 
@@ -287,7 +313,12 @@ export const AdminDashboardScreen = () => {
   const [brandLogoUri, setBrandLogoUri] = useState<string | null>(null);
   const [settingsPalette, setSettingsPalette] = useState<TenantPalette>(palette);
   const [expandedTransactionIds, setExpandedTransactionIds] = useState<Record<string, true>>({});
+  const [isDraggingInventory, setIsDraggingInventory] = useState(false);
   const [refreshingSnapshot, setRefreshingSnapshot] = useState(false);
+  const [contentWidth, setContentWidth] = useState(0);
+  const [replenishModalVisible, setReplenishModalVisible] = useState(false);
+  const [replenishingItem, setReplenishingItem] = useState<{ id: string; name: string; type: 'product' | 'inventory'; current: number } | null>(null);
+  const [replenishValue, setReplenishValue] = useState('');
 
   const tenantId = profile?.tenant_id ?? '';
   const isLandscape = width > height;
@@ -560,6 +591,7 @@ export const AdminDashboardScreen = () => {
       tenant_id: item.tenant_id,
       sku: item.sku,
       name: item.name,
+      category: item.category ?? '',
       quantity: item.quantity,
       unit: item.unit,
     });
@@ -658,6 +690,7 @@ export const AdminDashboardScreen = () => {
         tenant_id: tenantId,
         sku: inventoryForm.sku?.trim() || null,
         name: inventoryForm.name.trim(),
+        category: inventoryForm.category?.trim() || null,
         quantity: Math.max(0, Number(inventoryForm.quantity || 0)),
         unit: inventoryForm.unit?.trim() || 'pcs',
       });
@@ -781,6 +814,52 @@ export const AdminDashboardScreen = () => {
     setCategoryForm({ ...defaultCategoryForm, tenant_id: tenantId });
     await loadSnapshot();
   };
+
+  const handleOpenReplenish = (item: any, type: 'product' | 'inventory') => {
+    setReplenishingItem({
+      id: item.id,
+      name: item.name,
+      type,
+      current: type === 'product' ? item.stock_count : item.quantity,
+    });
+    setReplenishValue('');
+    setReplenishModalVisible(true);
+  };
+
+  const handleExecuteReplenish = async () => {
+    if (!tenantId || !replenishingItem) return;
+    const added = Number(replenishValue);
+    if (isNaN(added) || added <= 0) {
+      Alert.alert('Invalid amount', 'Please enter a positive number.');
+      return;
+    }
+
+    try {
+      if (replenishingItem.type === 'product') {
+        const product = snapshot?.products.find(p => p.id === replenishingItem.id);
+        if (product) {
+          await saveProduct({
+            ...product,
+            stock_count: (product.stock_count || 0) + added,
+          });
+        }
+      } else {
+        const item = snapshot?.inventoryItems.find(i => i.id === replenishingItem.id);
+        if (item) {
+          await saveInventoryItem({
+            ...item,
+            quantity: (item.quantity || 0) + added,
+          });
+        }
+      }
+      setReplenishModalVisible(false);
+      setStatusMessage(`Replenished ${replenishingItem.name} by ${added}.`);
+      await loadSnapshot();
+    } catch (error) {
+      Alert.alert('Replenish failed', error instanceof Error ? error.message : 'Unknown error');
+    }
+  };
+
 
   const handleDeleteCategory = async () => {
     if (!tenantId || !categoryForm.id || !snapshot) {
@@ -909,42 +988,20 @@ export const AdminDashboardScreen = () => {
   };
 
   const renderAnalytics = () => (
-    <View style={styles.contentStack}>
-      <GlassPanel>
-        <Text style={[styles.sectionTitle, { color: palette.text }]}>Today / Week / Month</Text>
-        <View style={styles.kpiGrid}>
-          <KpiCard label="Today Gross Sales" value={formatCurrency(topMetrics?.day.grossSalesCents ?? 0)} />
-          <KpiCard label="Today Net Profit" value={formatCurrency(topMetrics?.day.netProfitCents ?? 0)} />
-          <KpiCard label="Today Orders" value={`${topMetrics?.day.totalOrders ?? 0}`} />
-          <KpiCard label="Today AOV" value={formatCurrency(topMetrics?.day.averageOrderValueCents ?? 0)} />
-          <KpiCard label="Week Gross Sales" value={formatCurrency(topMetrics?.week.grossSalesCents ?? 0)} />
-          <KpiCard label="Month Gross Sales" value={formatCurrency(topMetrics?.month.grossSalesCents ?? 0)} />
-        </View>
-      </GlassPanel>
-
-      <GlassPanel>
-        <Text style={[styles.sectionTitle, { color: palette.text }]}>Top Sellers</Text>
-        {topMetrics?.topSellers.length ? (
-          topMetrics.topSellers.map((seller) => (
-            <View key={`${seller.productId ?? seller.productName}`} style={styles.listRow}>
-              <View style={{ flex: 1 }}>
-                <Text style={[styles.rowTitle, { color: palette.text }]}>{seller.productName}</Text>
-                <Text style={[styles.rowMeta, { color: palette.mutedText }]}>
-                  {seller.quantitySold} sold · {formatCurrency(seller.revenueCents)} revenue · {seller.marginPercent}% margin
-                </Text>
-              </View>
-              <Text style={[styles.rowValue, { color: palette.primary }]}>{formatCurrency(seller.grossMarginCents)}</Text>
-            </View>
-          ))
-        ) : (
-          <Text style={[styles.cardBody, { color: palette.mutedText }]}>No completed sales yet.</Text>
-        )}
-      </GlassPanel>
+    <View
+      style={styles.contentStack}
+      onLayout={(e) => setContentWidth(e.nativeEvent.layout.width)}
+    >
+      <SalesAnalyticsPanel snapshot={snapshot} containerWidth={contentWidth} />
 
       <GlassPanel>
         <Text style={[styles.sectionTitle, { color: palette.text }]}>Live Status</Text>
-        <Text style={[styles.cardBody, { color: palette.mutedText }]}>Transactions and inventory are stored locally first, then synced in the background.</Text>
-        {refreshingSnapshot ? <Text style={[styles.loadingHint, { color: palette.mutedText }]}>Live sync check running...</Text> : null}
+        <Text style={[styles.cardBody, { color: palette.mutedText }]}>
+          Transactions and inventory are stored locally first, then synced in the background.
+        </Text>
+        {refreshingSnapshot ? (
+          <Text style={[styles.loadingHint, { color: palette.mutedText }]}>Live sync check running...</Text>
+        ) : null}
         <Text style={[styles.cardBody, { color: palette.mutedText }]}>{statusMessage}</Text>
       </GlassPanel>
     </View>
@@ -965,7 +1022,7 @@ export const AdminDashboardScreen = () => {
                   <Pressable style={styles.transactionHeader} onPress={() => toggleTransactionExpanded(transaction.id)}>
                     <View style={{ flex: 1 }}>
                       <Text style={[styles.rowTitle, { color: palette.text }]} numberOfLines={1}>
-                        {transaction.id.slice(0, 8).toUpperCase()}
+                        {transaction.items.map(item => item.productName).join(', ')}
                       </Text>
                       <Text style={[styles.rowMeta, { color: palette.mutedText }]}>
                         {dateTimeFormatter.format(new Date(transaction.createdAt))} · {transaction.items.length} item{transaction.items.length === 1 ? '' : 's'}
@@ -1041,10 +1098,10 @@ export const AdminDashboardScreen = () => {
                   <View style={styles.transactionHeader}>
                     <View style={{ flex: 1 }}>
                       <Text style={[styles.rowTitle, { color: palette.text }]} numberOfLines={1}>
-                        Shift {report.id.slice(0, 8).toUpperCase()}
+                        {dayFormatter.format(new Date(report.createdAt))}
                       </Text>
                       <Text style={[styles.rowMeta, { color: palette.mutedText }]}>
-                        {dateTimeFormatter.format(new Date(report.createdAt))}
+                        {dateTimeFormatter.format(new Date(report.createdAt))} • {formatRelativeTime(new Date(report.createdAt))}
                       </Text>
                     </View>
                     <View style={styles.transactionHeaderRight}>
@@ -1266,8 +1323,20 @@ export const AdminDashboardScreen = () => {
                 <Text style={[styles.inventoryMeta, { color: palette.mutedText }]} numberOfLines={2}>
                   {formatCurrency(product.selling_price_cents)} sell · {formatCurrency(product.cost_price_cents)} cost
                 </Text>
-                <Text style={[styles.inventoryMeta, { color: palette.mutedText }]}>Stock {product.stock_count}</Text>
+                <Text style={[styles.inventoryMeta, { color: palette.mutedText }]}>
+                  Stock <Text style={{ color: (product.inventory_tracking && product.stock_count < 10) ? palette.danger : palette.mutedText, fontWeight: (product.inventory_tracking && product.stock_count < 10) ? '700' : '400' }}>{product.stock_count}</Text>
+                  {(product.inventory_tracking && product.stock_count < 10) && <Text style={{ color: palette.danger }}> ⚠</Text>}
+                </Text>
                 <Text style={[styles.rowValue, { color: product.active ? palette.success : palette.mutedText, marginTop: 6 }]}>{product.active ? 'On' : 'Off'} · Tap to edit</Text>
+                <Pressable
+                  style={[styles.replenishButton, { backgroundColor: `${palette.primary}22`, borderColor: palette.primary }]}
+                  onPress={(e) => {
+                    e.stopPropagation();
+                    handleOpenReplenish(product, 'product');
+                  }}
+                >
+                  <Text style={[styles.replenishButtonText, { color: palette.primary }]}>+ Replenish</Text>
+                </Pressable>
               </Pressable>
             ))}
           </View>
@@ -1287,6 +1356,7 @@ export const AdminDashboardScreen = () => {
         <Text style={[styles.sectionTitle, { color: palette.text }]}>{inventoryForm.id ? 'Edit Ingredient' : 'Add Ingredient'}</Text>
         <Text style={[styles.sectionHint, { color: palette.mutedText }]}>Track consumables like cups, straws, lids, and napkins.</Text>
         <Field label="Ingredient Name" value={inventoryForm.name} onChangeText={(nextValue) => setInventoryForm((current) => ({ ...current, name: nextValue }))} placeholder="Cups" />
+        <Field label="Category (optional)" value={inventoryForm.category ?? ''} onChangeText={(nextValue) => setInventoryForm((current) => ({ ...current, category: nextValue }))} placeholder="Packaging" />
         <Field label="SKU (optional)" value={inventoryForm.sku ?? ''} onChangeText={(nextValue) => setInventoryForm((current) => ({ ...current, sku: nextValue }))} placeholder="SUP-CUP-12OZ" />
         <Field label="Quantity" value={String(inventoryForm.quantity)} onChangeText={(nextValue) => setInventoryForm((current) => ({ ...current, quantity: Number(nextValue) || 0 }))} placeholder="0" keyboardType="decimal-pad" />
         <Field label="Unit" value={inventoryForm.unit ?? ''} onChangeText={(nextValue) => setInventoryForm((current) => ({ ...current, unit: nextValue }))} placeholder="pcs" />
@@ -1333,28 +1403,81 @@ export const AdminDashboardScreen = () => {
           )}
         </View>
         {snapshot?.inventoryItems.length ? (
-          <View style={styles.inventoryGrid}>
-            {snapshot.inventoryItems.map((item) => (
-              <Pressable
-                key={item.id}
-                style={[styles.inventoryCard, { borderColor: `${palette.text}22`, backgroundColor: `${palette.surface}C8` }]}
-                onPress={() => (inventoryBulkMode ? toggleSelectInventoryId(item.id) : selectInventoryItem(item.id))}
-                onLongPress={() => {
-                  setInventoryBulkMode(true);
-                  toggleSelectInventoryId(item.id);
-                }}
-              >
-                {inventoryBulkMode && (
-                  <View style={{ position: 'absolute', top: 8, left: 8, zIndex: 2 }}>
-                    <Text style={{ color: selectedInventoryIds[item.id] ? palette.primary : palette.mutedText }}>{selectedInventoryIds[item.id] ? '✓' : '○'}</Text>
+          <DraggableFlatList
+            data={snapshot.inventoryItems}
+            contentContainerStyle={{ padding: 16, paddingBottom: 100 }}
+            onDragBegin={() => setIsDraggingInventory(true)}
+            onDragEnd={({ data }) => {
+              setIsDraggingInventory(false);
+              // In a real app, we would persist the order. 
+            }}
+            keyExtractor={(item) => item.id}
+            renderItem={({ item, drag, isActive }: RenderItemParams<LocalInventoryItem>) => (
+              <ScaleDecorator>
+                <Pressable
+                  onLongPress={drag}
+                  disabled={isActive}
+                  style={[
+                    styles.inventoryRow,
+                    { 
+                      borderColor: `${palette.text}22`, 
+                      backgroundColor: isActive ? `${palette.primary}22` : `${palette.surface}C8`,
+                    }
+                  ]}
+                  onPress={() => (inventoryBulkMode ? toggleSelectInventoryId(item.id) : selectInventoryItem(item.id))}
+                >
+                  <View style={{ marginRight: 4 }}>
+                    <Text style={{ fontSize: 18, color: palette.mutedText, opacity: 0.5 }}>⠿</Text>
                   </View>
-                )}
-                <Text style={[styles.rowTitle, { color: palette.text }]} numberOfLines={1}>{item.name}</Text>
-                <Text style={[styles.inventoryMeta, { color: palette.mutedText }]}>{item.sku ? `SKU: ${item.sku}` : 'No SKU'}</Text>
-                <Text style={[styles.inventoryMeta, { color: palette.mutedText }]}>{`${item.quantity} ${item.unit ?? 'pcs'}`}</Text>
-              </Pressable>
-            ))}
-          </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.rowTitle, { color: palette.text }]} numberOfLines={1}>{item.name}</Text>
+                    <Text style={[styles.inventoryMeta, { color: palette.mutedText }]}>{item.category || 'Uncategorized'} · {item.sku || 'No SKU'}</Text>
+                    <Text style={[styles.inventoryMeta, { color: (item.quantity < 10) ? palette.danger : palette.mutedText, fontWeight: (item.quantity < 10) ? '700' : '400' }]}>
+                      {`${item.quantity} ${item.unit ?? 'pcs'}`}
+                      {(item.quantity < 10) && <Text style={{ color: palette.danger }}> ⚠</Text>}
+                    </Text>
+                  </View>
+                  <View style={{ flexDirection: 'row', gap: 6 }}>
+                    <Pressable
+                      style={[styles.replenishButton, { backgroundColor: `${palette.primary}22`, borderColor: palette.primary, marginTop: 0 }]}
+                      onPress={(e) => {
+                        e.stopPropagation();
+                        handleOpenReplenish(item, 'inventory');
+                      }}
+                    >
+                      <Text style={[styles.replenishButtonText, { color: palette.primary }]}>+ Stock</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.replenishButton, { backgroundColor: `${palette.accent}22`, borderColor: palette.accent, marginTop: 0 }]}
+                      onPress={(e) => {
+                        e.stopPropagation();
+                        Alert.prompt(
+                          'Change Category',
+                          `Enter new category for "${item.name}":`,
+                          [
+                            { text: 'Cancel', style: 'cancel' },
+                            {
+                              text: 'Move',
+                              onPress: async (newCat) => {
+                                if (newCat) {
+                                  await saveInventoryItem({ ...item, category: newCat.trim() });
+                                  await loadSnapshot();
+                                }
+                              }
+                            }
+                          ],
+                          'plain-text',
+                          item.category ?? ''
+                        );
+                      }}
+                    >
+                      <Text style={[styles.replenishButtonText, { color: palette.accent }]}>Move</Text>
+                    </Pressable>
+                  </View>
+                </Pressable>
+              </ScaleDecorator>
+            )}
+          />
         ) : (
           <View style={styles.emptyStateBlock}>
             <Text style={[styles.emptyStateTitle, { color: palette.text }]}>No ingredients yet</Text>
@@ -1531,7 +1654,12 @@ export const AdminDashboardScreen = () => {
       <View style={[styles.heroGlow, { backgroundColor: palette.accent }]} />
 
       <View style={isLandscape ? styles.landscapeLayout : styles.portraitLayout}>
-        <ScrollView style={styles.mainScroll} contentContainerStyle={[styles.scrollContent, isLandscape ? styles.scrollContentLandscape : null]} showsVerticalScrollIndicator={false}>
+        <ScrollView 
+          style={styles.mainScroll} 
+          contentContainerStyle={[styles.scrollContent, isLandscape ? styles.scrollContentLandscape : null]} 
+          showsVerticalScrollIndicator={false}
+          scrollEnabled={activeTab !== 'inventory'}
+        >
         <BrandHeader
           title={profile?.tenant_name ?? 'Tenant Admin'}
           subtitle={`Role: ${profile?.role ?? 'Unknown'}`}
@@ -1573,6 +1701,46 @@ export const AdminDashboardScreen = () => {
           {navContent}
         </View>
       </View>
+
+      <Modal
+        animationType="fade"
+        transparent={true}
+        visible={replenishModalVisible}
+        onRequestClose={() => setReplenishModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <GlassPanel style={styles.replenishModalContent}>
+            <Text style={[styles.sectionTitle, { color: palette.text }]}>Replenish Stock</Text>
+            <Text style={[styles.cardBody, { color: palette.mutedText, marginBottom: 16 }]}>
+              Add quantity to {replenishingItem?.name}.
+              Current: {replenishingItem?.current}
+            </Text>
+            
+            <Field
+              label="Amount to add"
+              value={replenishValue}
+              onChangeText={setReplenishValue}
+              placeholder="0"
+              keyboardType="numeric"
+            />
+
+            <View style={[styles.actionRow, { marginTop: 16 }]}>
+              <Pressable 
+                style={[styles.primaryButton, { backgroundColor: palette.primary, flex: 1 }]}
+                onPress={handleExecuteReplenish}
+              >
+                <Text style={styles.primaryButtonText}>Confirm Add</Text>
+              </Pressable>
+              <Pressable 
+                style={[styles.ghostButton, { borderColor: `${palette.text}33`, flex: 1 }]}
+                onPress={() => setReplenishModalVisible(false)}
+              >
+                <Text style={[styles.ghostButtonText, { color: palette.text }]}>Cancel</Text>
+              </Pressable>
+            </View>
+          </GlassPanel>
+        </View>
+      </Modal>
     </View>
   );
 };
@@ -2092,5 +2260,52 @@ const styles = StyleSheet.create({
     width: 20,
     height: 3,
     borderRadius: 999,
+  },
+  replenishButton: {
+    marginTop: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    alignItems: 'center',
+  },
+  replenishButtonText: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  replenishModalContent: {
+    width: '100%',
+    maxWidth: 400,
+    padding: 24,
+  },
+  inventoryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 16,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: 8,
+    gap: 12,
+  },
+  inventoryCategoryContainer: {
+    gap: 20,
+  },
+  inventoryCategoryGroup: {
+    gap: 10,
+  },
+  categoryHeader: {
+    fontSize: 14,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+    marginBottom: 4,
+    marginLeft: 4,
   },
 });

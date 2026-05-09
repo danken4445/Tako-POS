@@ -86,6 +86,6 @@ export const getPosSnapshot = async (tenantId: string): Promise<PosSnapshot> => 
 
 export const createSaleLocalFirst = async (input: LocalSaleInput): Promise<string> => {
   const saleId = await createLocalSale(input);
-  void triggerSyncNow();
+  void triggerSyncNow(input.tenant_id);
   return saleId;
 };
